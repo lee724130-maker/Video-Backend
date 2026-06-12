@@ -1,0 +1,36 @@
+# Node
+node_modules/
+dist/
+.env
+
+# Java
+target/
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Temp files
+temp/
+
+# Cookie files (contain session credentials)
+*_cookies.txt
+
+# Uploaded avatars
+uploads/avatars/
+
+# Executables
+yt-dlp.exe
+
+# Redis
+dump.rdb
+appendonly.aof
+
+# env files
+.env
+application.yml
+application-prod.yml
