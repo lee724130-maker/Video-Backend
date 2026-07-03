@@ -495,9 +495,9 @@ async function extractAudio(videoUrl, fallbackUrl) {
 }
 
 // Whisper 转写（语音转文字）- 优化版
-async function transcribeWithWhisper(audioPath, language = 'zh') {
-  console.log(`🎙️ 开始语音转文字，语言: ${language}`)
-  
+async function transcribeWithWhisper(audioPath, language = 'zh', modelName = 'tiny') {
+  console.log(`🎙️ 开始语音转文字，模型=${modelName}, 语言: ${language}`)
+
   return new Promise((resolve, reject) => {
     const pythonScript = `
 import sys
@@ -509,16 +509,16 @@ except ImportError:
     sys.exit(1)
 
 def main():
-    if len(sys.argv) < 2:
-        print(json.dumps({"error": "No audio file path provided"}))
+    if len(sys.argv) < 3:
+        print(json.dumps({"error": "Missing arguments"}))
         sys.exit(1)
-    
+
     audio_path = sys.argv[1]
-    language = sys.argv[2] if len(sys.argv) > 2 else None
-    
+    model_name = sys.argv[2]
+    language = sys.argv[3] if len(sys.argv) > 3 else None
+
     try:
-        # 使用 tiny 模型，更快且内存占用更少
-        model = whisper.load_model("tiny")
+        model = whisper.load_model(model_name)
         result = model.transcribe(audio_path, language=language if language != "auto" else None)
         print(json.dumps({"text": result["text"], "language": result["language"]}))
     except Exception as e:
@@ -528,44 +528,52 @@ def main():
 if __name__ == "__main__":
     main()
 `
-    const pythonProcess = spawn('python3', ['-c', pythonScript, audioPath, language])
-    
+    const pythonProcess = spawn('python3', ['-c', pythonScript, audioPath, modelName, language])
+
     let output = ''
     let errorOutput = ''
-    
+
     // 设置超时（5分钟）
     const timeout = setTimeout(() => {
       console.error('Whisper 转写超时，正在终止进程...')
       pythonProcess.kill('SIGTERM')
       reject(new Error('Whisper 转写超时（5分钟）'))
     }, 300000)
-    
+
     pythonProcess.stdout.on('data', (data) => {
       output += data.toString()
     })
-    
+
     pythonProcess.stderr.on('data', (data) => {
       errorOutput += data.toString()
     })
-    
+
     pythonProcess.on('close', (code) => {
       clearTimeout(timeout)
-      
+
+      // 先检查 stdout 中是否有错误信息，再检查退出码
+      let errorFromOutput = ''
+      try {
+        const parsed = JSON.parse(output)
+        if (parsed.error) errorFromOutput = parsed.error
+      } catch {}
+
       if (code !== 0) {
-        console.error('Whisper 转写失败，错误码:', code)
-        console.error('错误输出:', errorOutput)
-        reject(new Error('语音转文字失败: ' + (errorOutput || '未知错误')))
+        const errMsg = errorFromOutput || errorOutput || '未知错误'
+        console.error(`Whisper ${modelName} 转写失败: ${errMsg}`)
+        reject(new Error(`语音转文字失败: ${errMsg}`))
         return
       }
-      
+
+      if (errorFromOutput) {
+        reject(new Error(errorFromOutput))
+        return
+      }
+
       try {
         const result = JSON.parse(output)
-        if (result.error) {
-          reject(new Error(result.error))
-        } else {
-          console.log(`✅ 语音转文字完成，检测到语言: ${result.language}`)
-          resolve(result.text)
-        }
+        console.log(`✅ 语音转文字完成(模型=${modelName})，检测到语言: ${result.language}`)
+        resolve(result.text)
       } catch (e) {
         console.error('解析 Whisper 输出失败:', e)
         console.error('原始输出:', output)
@@ -633,11 +641,18 @@ async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDura
     return { text: "", method: 'none', videoType, videoPath: '' }
   }
   try {
-    const text = await transcribeWithWhisper(audioPath, 'zh')
+    // 先尝试 tiny 模型
+    const text = await transcribeWithWhisper(audioPath, 'zh', 'tiny')
     return { text, utterances: [], method: 'whisper', videoType, videoPath }
   } catch (whisperError) {
-    console.error('⚠️ Whisper 转写失败，使用降级方案:', whisperError.message)
-    return { text: "", method: 'none', videoType, videoPath: '' }
+    console.warn(`⚠️ tiny 模型失败: ${whisperError.message}，尝试 base 模型...`)
+    try {
+      const text = await transcribeWithWhisper(audioPath, 'zh', 'base')
+      return { text, utterances: [], method: 'whisper', videoType, videoPath }
+    } catch (baseError) {
+      console.error('⚠️ base 模型也失败，使用降级方案:', baseError.message)
+      return { text: "", method: 'none', videoType, videoPath: '' }
+    }
   } finally {
     if (audioPath) cleanupTempFile(audioPath)
   }
@@ -823,6 +838,12 @@ function pointsFromSummary(summary, title) {
   return points
 }
 
+// 统一编号格式：1）→ 1.  2）→ 2.  等
+function normalizeNumbering(text) {
+  if (typeof text !== 'string') return text
+  return text.replace(/(\d+)[）)]/g, '$1.')
+}
+
 // 递归展平 JSON 字符串字段：如果字段值是 JSON 字符串，解析并提取
 function tryParseField(value, depth = 0) {
   if (depth > 3) return value
@@ -850,9 +871,9 @@ function normalizeAnalysisResult(raw, context = {}) {
   // 递归展平 summary，防止双层 JSON
   const rawSummary = tryParseField(result.summary || result.overview || result.abstract || '')
   const summary = (typeof rawSummary === 'object' ? (rawSummary.summary || rawSummary.overview || '') : String(rawSummary)).trim()
-  let keyPoints = normalizeStringList(result.keyPoints || result.key_points || result.points || result.highlights)
+  let keyPoints = normalizeStringList(result.keyPoints || result.key_points || result.points || result.highlights).map(kp => normalizeNumbering(kp))
   const details = result.details && typeof result.details === 'object'
-    ? Object.fromEntries(Object.entries(result.details).map(([k, v]) => [k, String(tryParseField(v)).trim()]))
+    ? Object.fromEntries(Object.entries(result.details).map(([k, v]) => [k, normalizeNumbering(String(tryParseField(v)).trim())]))
     : {}
   const deepAnalysis = result.deepAnalysis || result.deep_analysis
   const cleanedDeep = deepAnalysis && typeof deepAnalysis === 'object'
@@ -1006,8 +1027,16 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
     temperature: 0.7
   }
 
+  const hasContent = content && content.length > 10
+  const noContentWarning = hasContent ? '' : `
+⚠️ 重要限制：当前【没有可用的文字内容】（字幕/语音转写全部失败），你只能依据视频标题和画面截图分析。
+- 禁止编造具体数字、比分、时间、人名等无法从画面直接确认的细节
+- 如果画面中看不到记分牌或具体比分，请标注"（基于画面推断）"
+- 分析可以基于画面内容合理推测，但必须在分析中明确标注"（画面推测）"
+- 宁可写得简短诚实，也不要编造虚假细节`
+
   const systemPrompt = `你是资深视频内容分析师，拥有视觉理解能力。你会同时收到视频的【文字内容（字幕/语音转写）】和【视频画面截图】。
-你需要结合两者进行分析：文字提供对话、术语和数据，画面提供图表、表情、实物演示、PPT、场景氛围等视觉信息。
+你需要结合两者进行分析：文字提供对话、术语和数据，画面提供图表、表情、实物演示、PPT、场景氛围等视觉信息。${noContentWarning}
 
 分析要求：
 1. 优先使用文字内容提取核心观点和论证逻辑
@@ -1028,8 +1057,13 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
 async function analyzeWithModel(title, content, videoUrl, modelType = 'recommended') {
   const config = getModelConfig(modelType)
   if (!config) throw new Error(`未知的模型类型: ${modelType}`)
+  const hasContent = content && content.length > 10
+  let systemPrompt = config.systemPrompt
+  if (!hasContent) {
+    systemPrompt = `你只能根据标题和信息推断视频内容。必须明确写“基于有限信息推断”。\n\n重要限制：没有可用的文字内容（字幕/语音转写失败），禁止编造具体数字、比分、人名等无法确认的细节。\n\n格式要求与标准分析完全一致：返回完整 JSON，包含 summary、keyPoints、topics、details、deepAnalysis、quotes。\n- keyPoints 至少3条，每条标注"（基于有限信息）"\n- 宁可简短诚实，不要编造虚假信息`
+  }
   const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n可用内容：\n${content?.substring(0, 24000) || '无正文内容，请基于标题和上下文推断，但必须标注“基于有限信息推断”。'}`
-  const raw = await callAIModel(config, config.systemPrompt, userPrompt)
+  const raw = await callAIModel(config, systemPrompt, userPrompt)
   return normalizeAnalysisResult(raw, { title, videoUrl })
 }
 
