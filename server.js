@@ -1013,17 +1013,6 @@ app.post('/api/app/parse', authenticateAppUser, async (req, res) => {
     return res.status(400).json({ code: 400, message: '请提供视频链接' })
   }
 
-  // ========== 抖音链接拦截 - 返回维护提示 ==========
-  if (isDouyinUrl(url)) {
-    console.log(`🚫 拦截抖音链接: ${url}`)
-    return res.status(400).json({
-      code: 400,
-      message: '抖音视频解析正在维护中，请使用 B站、YouTube 等其他平台链接',
-      data: null
-    })
-  }
-  // ========== 拦截结束 ==========
-
   try {
     // 1. 检查用户信息和积分
     const [users] = await pool.query(
@@ -1046,13 +1035,13 @@ app.post('/api/app/parse', authenticateAppUser, async (req, res) => {
       return res.status(400).json({ code: 400, message: `积分不足，当前模型需要 ${creditCost} 积分` })
     }
 
-    // 2. 获取视频基本信息
-    let videoInfo
+    // 2. 获取视频基本信息（非必须——worker 会用 ffprobe 补全）
+    let videoInfo = { title: '解析中…', duration: 0, thumbnail: '', uploader: '', description: '', video_url: '', webpage_url: url }
     try {
-      videoInfo = await getVideoInfo(url)
+      const info = await getVideoInfo(url)
+      if (info) Object.assign(videoInfo, info)
     } catch (infoError) {
-      console.error('获取视频信息失败:', infoError)
-      return res.status(400).json({ code: 400, message: infoError.message || '无法获取视频信息，请检查链接是否有效' })
+      console.error('⚠️ 获取视频信息失败（将继续处理）:', infoError.message)
     }
 
     // 3. 创建任务记录
@@ -1061,7 +1050,7 @@ app.post('/api/app/parse', authenticateAppUser, async (req, res) => {
                      url.includes('bilibili') ? 'bilibili' : 
                      url.includes('douyin') ? 'douyin' : 
                      url.includes('tiktok') ? 'tiktok' : 
-                     url.includes('xiaohongshu') ? 'xiaohongshu' : 'other'
+                     url.includes('xiaohongshu') || url.includes('xhslink') ? 'xiaohongshu' : 'other'
     
     const formattedNow = getBeijingTime()
     
@@ -1423,6 +1412,166 @@ app.post('/api/app/mindmap/:taskId', authenticateAppUser, async (req, res) => {
   } catch (error) {
     console.error('生成思维导图失败:', error)
     res.status(500).json({ code: 500, message: error.message || '生成失败' })
+  }
+})
+
+// ========== 视频代理下载（解决 CDN 403 问题） ==========
+app.get('/api/app/proxy-video', async (req, res) => {
+  const videoUrl = req.query.url
+  const token = req.query.token || req.headers.authorization?.replace('Bearer ', '')
+  const referer = req.query.ref || ''
+  if (!videoUrl) return res.status(400).json({ code: 400, message: '缺少 url 参数' })
+  if (!token) return res.status(401).json({ code: 401, message: '未登录' })
+
+  try {
+    jwt.verify(token, JWT_SECRET)
+  } catch {
+    return res.status(401).json({ code: 401, message: '登录已过期' })
+  }
+
+  // 设置通用响应头
+  const setStreamHeaders = () => {
+    res.setHeader('Content-Disposition', `attachment; filename="video-${Date.now()}.mp4"`)
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+    res.setHeader('Pragma', 'no-cache')
+  }
+
+  const decodedUrl = decodeURIComponent(videoUrl)
+  const webpageUrl = referer || decodedUrl
+
+  // B 站需要 yt-dlp 音视频合并下载（先下载到临时文件再流式传输，避免管道合并丢失视频流）
+  if (referer && referer.includes('bilibili.com')) {
+    const { spawn } = require('child_process')
+
+    const tempId = `bili_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.mp4`
+    const tempPath = path.join(tempDir, tempId)
+    const biliCookies = path.join(__dirname, 'bilibili_cookies.txt')
+    const args = ['-f', 'bv*+ba/b', '--merge-output-format', 'mp4', '--no-part', '-o', tempPath, webpageUrl]
+    if (fs.existsSync(biliCookies)) {
+      args.unshift('--cookies', biliCookies)
+    }
+
+    let killed = false
+    let stream = null
+    const ytDlp = spawn('yt-dlp', args)
+    const ytTimeout = setTimeout(() => { if (!killed) { killed = true; ytDlp.kill('SIGTERM') } }, 600000)
+
+    const cleanup = () => {
+      try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath) } catch {}
+    }
+
+    res.on('close', () => {
+      if (stream) stream.destroy()
+      if (!killed) {
+        killed = true
+        ytDlp.kill('SIGTERM')
+        setTimeout(() => { try { ytDlp.kill('SIGKILL') } catch {} }, 5000)
+      }
+      cleanup()
+    })
+
+    ytDlp.stderr.on('data', (d) => {
+      const msg = d.toString()
+      if (msg.includes('ERROR')) console.error('❌ yt-dlp:', msg.substring(0, 200))
+    })
+
+    ytDlp.on('error', (err) => {
+      clearTimeout(ytTimeout)
+      killed = true
+      console.error('❌ yt-dlp 启动失败:', err.message)
+      cleanup()
+      if (!res.headersSent) res.status(500).json({ code: 500, message: '视频下载失败' })
+    })
+
+    ytDlp.on('exit', (code) => {
+      clearTimeout(ytTimeout)
+      if (killed) { cleanup(); return }
+      if (code !== 0) {
+        console.error('❌ yt-dlp 异常退出, code:', code)
+        cleanup()
+        if (!res.headersSent) res.status(502).json({ code: 502, message: '视频下载失败' })
+        return
+      }
+      if (!fs.existsSync(tempPath)) {
+        cleanup()
+        if (!res.headersSent) res.status(502).json({ code: 502, message: '视频文件未生成' })
+        return
+      }
+      const stat = fs.statSync(tempPath)
+      setStreamHeaders()
+      res.setHeader('Content-Type', 'video/mp4')
+      res.setHeader('Content-Length', stat.size)
+      stream = fs.createReadStream(tempPath)
+      stream.pipe(res)
+      stream.on('end', cleanup)
+      stream.on('error', (err) => {
+        console.error('❌ B站视频流传输失败:', err.message)
+        cleanup()
+      })
+    })
+    return
+  }
+
+  // 其他平台：直接代理 CDN 直链
+  try {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 600000)
+    let response
+    try {
+      const fetchHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'
+      }
+      if (referer) {
+        fetchHeaders['Referer'] = referer
+      } else if (decodedUrl.includes('bilivideo.com')) {
+        fetchHeaders['Referer'] = 'https://www.bilibili.com/'
+      } else if (decodedUrl.includes('xhscdn.com')) {
+        fetchHeaders['Referer'] = 'https://www.xiaohongshu.com/'
+      } else {
+        try {
+          const u = new URL(decodedUrl)
+          fetchHeaders['Referer'] = u.origin + '/'
+        } catch {}
+      }
+      response = await fetch(decodedUrl, { signal: controller.signal, headers: fetchHeaders })
+    } finally {
+      clearTimeout(timeoutId)
+    }
+
+    if (!response.ok) {
+      return res.status(502).json({ code: 502, message: `视频源返回 ${response.status}` })
+    }
+
+    const contentType = response.headers.get('content-type') || 'video/mp4'
+    const contentLength = response.headers.get('content-length')
+    res.setHeader('Content-Type', contentType)
+    if (contentLength) res.setHeader('Content-Length', contentLength)
+    setStreamHeaders()
+
+    const { Readable } = require('stream')
+    const nodeStream = Readable.fromWeb(response.body)
+
+    res.on('close', () => {
+      if (!res.writableFinished) {
+        controller.abort()
+        nodeStream.destroy()
+      }
+    })
+
+    nodeStream.on('error', (err) => {
+      console.error('❌ 视频流传输错误:', err.message)
+      if (!res.headersSent) res.status(500).json({ code: 500, message: '视频下载失败' })
+    })
+
+    nodeStream.pipe(res)
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      if (!res.headersSent) return res.status(504).json({ code: 504, message: '视频源响应超时' })
+      return
+    }
+    console.error('❌ 视频代理下载失败:', error.message)
+    if (!res.headersSent) res.status(500).json({ code: 500, message: '视频下载失败' })
   }
 })
 
@@ -3180,6 +3329,19 @@ async function startServer() {
     console.log(`   ⭐ 推荐: 阿里云百炼 (tongyi-xiaomi-analysis-pro)`)
     console.log(`=================================`)
   })
+
+  // 优雅关闭
+  const shutdown = async () => {
+    console.log('⏳ 正在关闭服务...')
+    try {
+      const { closeBrowser } = require('./xiaohongshu_playwright')
+      await closeBrowser()
+      console.log('✅ Chromium 已关闭')
+    } catch {}
+    process.exit(0)
+  }
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
 }
 
 startServer()

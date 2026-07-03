@@ -11,11 +11,13 @@ console.log(`📊 队列名称: ${videoQueue.name}`)
 process.on('SIGTERM', async () => {
   console.log('收到 SIGTERM 信号，正在关闭 Worker...')
   await videoQueue.close()
+  try { const { closeBrowser } = require('./xiaohongshu_playwright'); await closeBrowser() } catch {}
   process.exit(0)
 })
 
 process.on('SIGINT', async () => {
   console.log('收到 SIGINT 信号，正在关闭 Worker...')
   await videoQueue.close()
+  try { const { closeBrowser } = require('./xiaohongshu_playwright'); await closeBrowser() } catch {}
   process.exit(0)
 })

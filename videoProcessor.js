@@ -1,4 +1,4 @@
-const fs = require('fs')
+﻿const fs = require('fs')
 const path = require('path')
 const { exec, spawn } = require('child_process')
 const util = require('util')
@@ -7,16 +7,16 @@ const execPromise = util.promisify(exec)
 
 // 配置
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp'
-const DOUYIN_COOKIES_FILE = path.join(__dirname, 'douyin_cookies.txt')
 const BILIBILI_COOKIES_FILE = path.join(__dirname, 'bilibili_cookies.txt')
 const tempDir = path.join(__dirname, 'temp')
-const amagi = require('@ikenxuan/amagi');
 
 // API Keys
 const BAILIAN_API_KEY = process.env.BAILIAN_API_KEY
 const BAILIAN_BASE_URL = process.env.BAILIAN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 const BAILIAN_MODEL_PRO = process.env.BAILIAN_MODEL_PRO || 'tongyi-xiaomi-analysis-pro'
 const BAILIAN_MODEL_FLASH = process.env.BAILIAN_MODEL_FLASH || 'tongyi-xiaomi-analysis-flash'
+const BAILIAN_MODEL_VL = process.env.BAILIAN_MODEL_VL || 'qwen2.5-vl-72b-instruct'
+const BAILIAN_MODEL_VL_LITE = process.env.BAILIAN_MODEL_VL_LITE || 'qwen2.5-vl-7b-instruct'
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com'
 const DOUBAO_API_KEY = process.env.DOUBAO_API_KEY
@@ -59,23 +59,216 @@ function isDouyinUrl(url) {
   return urlStr.includes('douyin.com') || urlStr.includes('v.douyin.com');
 }
 
-// ========== 抖音专用解析器（已禁用，返回友好错误）==========
-async function getDouyinVideoInfo(videoUrl) {
-  console.log(`🚫 抖音解析已禁用: ${videoUrl}`);
-  throw new Error('抖音视频解析正在维护中，请使用 B站、YouTube 等其他平台链接');
+// ========== 小红书链接检测 ==========
+function isXiaohongshuUrl(url) {
+  if (!url) return false;
+  const urlStr = String(url).toLowerCase();
+  return urlStr.includes('xiaohongshu.com') || urlStr.includes('xhslink.com');
 }
 
-// 构建 yt-dlp 命令（仅用于非抖音平台）
+// 从抖音短链接中提取 video_id
+async function resolveDouyinVideoId(videoUrl) {
+  const urlStr = String(videoUrl).toLowerCase()
+
+  // 如果已经是完整链接（含 /video/），直接提取 ID
+  const fullMatch = urlStr.match(/douyin\.com\/video\/(\d+)/)
+  if (fullMatch) return fullMatch[1]
+
+  // iesdouyin 分享页格式（数字 ID 或短码）
+  const iesNumMatch = urlStr.match(/iesdouyin\.com\/share\/video\/(\d+)/)
+  if (iesNumMatch) return iesNumMatch[1]
+  const iesCodeMatch = urlStr.match(/iesdouyin\.com\/share\/video\/([a-zA-Z0-9]+)/)
+  if (iesCodeMatch) return iesCodeMatch[1]
+
+  // 短链接 v.douyin.com/xxx → 多次尝试获取 video ID
+  // 方法1: 用 redirect follow 获取最终 URL
+  try {
+    const response = await fetch(videoUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36'
+      },
+      redirect: 'follow'
+    })
+    const finalUrl = response.url
+    const idMatch = finalUrl.match(/video\/(\d+)/)
+    if (idMatch) return idMatch[1]
+  } catch {}
+
+  // 方法2: 从分享短链接 HTML 中提取 canonical URL 或 video ID
+  try {
+    const resp = await fetch(videoUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36'
+      },
+      redirect: 'manual'
+    })
+    const location = resp.headers.get('location') || resp.headers.get('Location') || ''
+    const locMatch = location.match(/video\/(\d+)/)
+    if (locMatch) return locMatch[1]
+    const altMatch = location.match(/(\d{17,})/)
+    if (altMatch) return altMatch[1]
+
+    const text = await resp.text()
+    const canonMatch = text.match(/canonical[^>]+href="[^"]*\/video\/(\d+)/)
+    if (canonMatch) return canonMatch[1]
+    const ogMatch = text.match(/og:url[^>]+content="[^"]*\/video\/(\d+)/)
+    if (ogMatch) return ogMatch[1]
+  } catch {}
+
+  // 方法3: 提取短码，让 getDouyinVideoInfo 用 iesdouyin + Playwright 兜底
+  const shortCode = urlStr.match(/v\.douyin\.com\/([a-zA-Z0-9]+)/)
+  if (shortCode) return shortCode[1]
+
+  throw new Error('无法从抖音链接中提取视频ID')
+}
+
+// 从 HTML 中提取 window._ROUTER_DATA JSON
+function extractRouterData(html) {
+  const marker = 'window._ROUTER_DATA = '
+  const startIdx = html.indexOf(marker)
+  if (startIdx === -1) return null
+
+  let jsonStart = startIdx + marker.length
+  let bracketCount = 0
+  let inString = false
+  let escape = false
+  let jsonEnd = jsonStart
+
+  for (let i = jsonStart; i < html.length; i++) {
+    const char = html[i]
+    if (escape) { escape = false; continue }
+    if (char === '\\') { escape = true; continue }
+    if (char === '"' && !escape) { inString = !inString; continue }
+    if (!inString) {
+      if (char === '{') bracketCount++
+      else if (char === '}') {
+        bracketCount--
+        if (bracketCount === 0) { jsonEnd = i + 1; break }
+      }
+    }
+  }
+
+  const jsonStr = html.substring(jsonStart, jsonEnd)
+  return JSON.parse(jsonStr)
+}
+
+// ========== 抖音解析器（基于 iesdouyin.com 分享页）==========
+async function getDouyinVideoInfo(videoUrl) {
+  console.log(`📱 解析抖音视频: ${videoUrl}`)
+
+  const videoId = await resolveDouyinVideoId(videoUrl)
+  let html = ''
+  try {
+    const shareUrl = `https://www.iesdouyin.com/share/video/${videoId}/`
+    const response = await fetch(shareUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36',
+        'Referer': 'https://www.douyin.com/'
+      }
+    })
+    if (response.ok) {
+      html = await response.text()
+    }
+  } catch (iesErr) {
+    console.warn(`⚠️ iesdouyin 请求失败: ${iesErr.message}`)
+  }
+
+  const data = extractRouterData(html)
+
+  if (data) {
+    const loaderData = data.loaderData
+    const videoKey = Object.keys(loaderData).find(k => k !== 'video_layout' && loaderData[k]?.videoInfoRes)
+    const item = videoKey ? loaderData[videoKey].videoInfoRes.item_list?.[0] : undefined
+    if (item) {
+      const playUrl = item.video?.play_addr?.url_list?.[0] || ''
+      const noWatermarkUrl = playUrl.replace('/playwm/', '/play/').replace('playwm', 'play')
+      const thumbnail = item.video?.cover?.url_list?.[0] || item.video?.dynamic_cover?.url_list?.[0] || ''
+      const duration = item.video?.duration || 0
+      console.log(`✅ 抖音解析成功: ${item.desc?.substring(0, 50) || '无标题'}`)
+      return {
+        title: item.desc || '抖音视频',
+        duration: Math.floor(duration / 1000) || 0,
+        thumbnail: thumbnail,
+        uploader: item.author?.nickname || '未知作者',
+        description: item.desc || '',
+        webpage_url: `https://www.douyin.com/video/${videoId}`,
+        video_url: noWatermarkUrl
+      }
+    }
+  }
+
+  // Fallback: use Douyin Web API directly
+  console.log('🔄 iesdouyin 解析失败，尝试 Douyin API 直连')
+  try {
+    const apiUrl = `https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=${videoId}`
+    const apiRes = await fetch(apiUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+        'Referer': 'https://www.douyin.com/'
+      }
+    })
+    if (apiRes.ok) {
+      const apiData = await apiRes.json()
+      const item = apiData?.aweme_detail || apiData?.item_list?.[0]
+      if (item) {
+        const playUrl = item.video?.play_addr?.url_list?.[0] || item.video?.play_api?.url_list?.[0] || ''
+        const thumbnail = item.video?.cover?.url_list?.[0] || item.video?.dynamic_cover?.url_list?.[0] || ''
+        const duration = item.video?.duration || 0
+        console.log(`✅ 抖音 API 解析成功: ${item.desc?.substring(0, 50) || '无标题'}`)
+        return {
+          title: item.desc || '抖音视频',
+          duration: Math.floor(duration / 1000) || 0,
+          thumbnail: thumbnail,
+          uploader: item.author?.nickname || '未知作者',
+          description: item.desc || '',
+          webpage_url: `https://www.douyin.com/video/${videoId}`,
+          video_url: playUrl
+        }
+      }
+    }
+  } catch (apiErr) {
+    console.warn(`⚠️ Douyin API 请求失败: ${apiErr.message}`)
+  }
+
+  // Fallback: Playwright 浏览器解析
+  console.log('🔄 尝试 Playwright 解析抖音')
+  try {
+    const { resolveDouyinWithPlaywright } = require('./douyin_playwright')
+    const pwResult = await resolveDouyinWithPlaywright(videoUrl)
+    if (pwResult && (pwResult.video_url || pwResult.videoId)) {
+      console.log(`✅ Playwright 解析成功: ${(pwResult.title||'').substring(0, 50)}`)
+      return {
+        title: pwResult.title || '抖音视频',
+        duration: pwResult.duration || 0,
+        thumbnail: pwResult.thumbnail || '',
+        uploader: pwResult.uploader || '',
+        description: pwResult.description || '',
+        webpage_url: pwResult.webpage_url || `https://www.douyin.com/video/${pwResult.videoId}`,
+        video_url: pwResult.video_url || ''
+      }
+    }
+  } catch (pwErr) {
+    console.warn(`⚠️ Playwright 抖音解析失败: ${pwErr.message}`)
+  }
+
+  throw new Error('无法从抖音页面提取数据，页面结构可能已变更')
+}
+
+// 构建 yt-dlp 命令
 function buildYtdlpCommand(baseCmd, videoUrl) {
   let cmd = baseCmd
   cmd += ` --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"`
   
-  // YouTube 代理配置
+  // YouTube 配置
   if (videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')) {
     const proxy = process.env.YOUTUBE_PROXY || ''
     if (proxy) {
       cmd += ` --proxy "${proxy}"`
       console.log('🌐 使用代理访问 YouTube')
+    } else {
+      cmd += ` --extractor-args "youtube:player_client=android"`
+      console.log('📱 使用 Android 客户端模式解析 YouTube')
     }
   }
 
@@ -89,34 +282,60 @@ function buildYtdlpCommand(baseCmd, videoUrl) {
     }
   }
   
-  // 抖音降级备用（已禁用）
-  if (isDouyinUrl(videoUrl)) {
-    console.log('⚠️ 抖音链接已被拦截，不会进入 yt-dlp 降级分支')
-    throw new Error('抖音视频解析正在维护中，请使用其他平台链接')
-  }
   
   cmd += ` "${videoUrl}"`
   return cmd
 }
 
-// amagi 解析器（已禁用）
-async function getDouyinInfoWithAmagi(videoUrl) {
-  console.log(`🚫 [amagi] 抖音解析已禁用: ${videoUrl}`);
-  throw new Error('抖音视频解析正在维护中，请使用 B站、YouTube 等其他平台链接');
+// ========== 小红书解析器（基于 Playwright）==========
+const XHS_COOKIE_FILE = path.join(__dirname, 'xiaohongshu_cookies.json')
+
+async function getXiaohongshuVideoInfo(videoUrl) {
+  const { resolveXiaohongshuWithPlaywright } = require('./xiaohongshu_playwright')
+
+  // 首次：匿名解析
+  try {
+    const result = await resolveXiaohongshuWithPlaywright(videoUrl)
+    if (result && result.video_url) {
+      console.log(`✅ 小红书解析成功: ${result.title?.substring(0, 50)}`)
+      return result
+    }
+    throw new Error('未找到视频链接')
+  } catch (e) {
+    // 只有登录跳转错误且存在 Cookie 文件时才重试
+    if (e.code === 'LOGIN_REQUIRED' && fs.existsSync(XHS_COOKIE_FILE)) {
+      console.log('🍪 匿名访问需要登录，尝试使用 Cookie 重试...')
+      try {
+        const cookies = JSON.parse(fs.readFileSync(XHS_COOKIE_FILE, 'utf-8'))
+        const result = await resolveXiaohongshuWithPlaywright(videoUrl, { cookies })
+        if (result && result.video_url) {
+          console.log(`✅ 小红书 Cookie 解析成功: ${result.title?.substring(0, 50)}`)
+          return result
+        }
+      } catch (e2) {
+        console.error('小红书 Cookie 解析失败:', e2.message)
+      }
+    }
+    console.error('小红书解析失败:', e.message)
+    throw new Error('无法解析小红书视频: ' + e.message)
+  }
 }
 
-// 获取视频信息（主入口：抖音返回维护提示，其他走 yt-dlp）
+// 获取视频信息（主入口：抖音走Playwright，小红书走Playwright，其他走 yt-dlp）
 async function getVideoInfo(videoUrl) {
   console.log(`📥 获取视频信息: ${videoUrl}`)
   
-  // ========== 抖音链接拦截 - 返回维护提示 ==========
+  // 抖音使用专用解析器
   if (isDouyinUrl(videoUrl)) {
-    console.log('🚫 抖音解析暂时禁用（维护中）');
-    throw new Error('抖音视频解析正在维护中，请使用 B站、YouTube 等其他平台链接');
+    return await getDouyinVideoInfo(videoUrl)
   }
-  // ========== 拦截结束 ==========
   
-  // 非抖音平台：使用 yt-dlp
+  // 小红书使用 Playwright 解析器
+  if (isXiaohongshuUrl(videoUrl)) {
+    return await getXiaohongshuVideoInfo(videoUrl)
+  }
+  
+  // 其他平台：使用 yt-dlp
   console.log('🔍 使用 yt-dlp 解析')
   const baseCmd = `"${YTDLP_PATH}" --dump-json --skip-download`
   const cmd = buildYtdlpCommand(baseCmd, videoUrl)
@@ -129,13 +348,19 @@ async function getVideoInfo(videoUrl) {
       const videoId = extractYouTubeId(videoUrl)
       if (videoId) thumbnail = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`
     }
+    let directUrl = info.url
+    if (!directUrl && info.requested_formats) {
+      const videoFmt = info.requested_formats.find(f => f.video_ext && f.video_ext !== 'none')
+      if (videoFmt) directUrl = videoFmt.url
+    }
     return {
       title: info.title,
       duration: info.duration,
       thumbnail: thumbnail,
       uploader: info.uploader,
       description: info.description || '',
-      webpage_url: info.webpage_url
+      webpage_url: info.webpage_url,
+      video_url: directUrl || ''
     }
   } catch (error) {
     console.error('获取视频信息失败:', error.message)
@@ -146,11 +371,6 @@ async function getVideoInfo(videoUrl) {
 // 提取字幕
 async function extractSubtitles(videoUrl) {
   console.log(`📝 提取字幕: ${videoUrl}`)
-  
-  // 抖音链接拦截
-  if (isDouyinUrl(videoUrl)) {
-    throw new Error('抖音视频解析正在维护中，请使用其他平台链接')
-  }
   
   const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
   const subtitlePath = path.join(tempDir, `${tempId}`)
@@ -228,17 +448,22 @@ async function extractSubtitles(videoUrl) {
   }
 }
 
-// 下载音频
-async function extractAudio(videoUrl) {
+// 下载视频文件到本地
+async function downloadVideo(videoUrl, outputPath) {
+  console.log(`📥 下载视频: ${videoUrl?.substring(0, 50)}...`)
+  const cmd = `curl -L -s -o "${outputPath}" "${videoUrl}" --connect-timeout 30 --max-time 300`
+  await execPromise(cmd, { timeout: 310000 })
+  console.log(`✅ 视频下载完成: ${outputPath}`)
+}
+
+// 下载音频（yt-dlp 优先，失败则下载完整视频后从本地提取）
+// 返回 { audioPath, videoPath }，videoPath 可能为空
+async function extractAudio(videoUrl, fallbackUrl) {
   console.log(`🎵 提取音频: ${videoUrl}`)
-  
-  // 抖音链接拦截
-  if (isDouyinUrl(videoUrl)) {
-    throw new Error('抖音视频解析正在维护中，请使用其他平台链接')
-  }
   
   const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
   const audioPath = path.join(tempDir, `${tempId}.mp3`)
+  let videoPath = ''
   
   const baseCmd = `"${YTDLP_PATH}" -x --audio-format mp3 --audio-quality 0 --no-playlist -o "${audioPath}"`
   const cmd = buildYtdlpCommand(baseCmd, videoUrl)
@@ -246,10 +471,26 @@ async function extractAudio(videoUrl) {
   try {
     await execPromise(cmd, { timeout: 300000 })
     console.log(`✅ 音频下载完成: ${audioPath}`)
-    return audioPath
+    return { audioPath, videoPath }
   } catch (error) {
-    console.error('提取音频失败:', error.message)
-    return null
+    console.error('yt-dlp 提取音频失败:', error.message)
+    if (fallbackUrl) {
+      videoPath = path.join(tempDir, `${tempId}.mp4`)
+      try {
+        await downloadVideo(fallbackUrl, videoPath)
+        const ffmpegCmd = `ffmpeg -y -i "${videoPath}" -vn -acodec libmp3lame -ab 128k -ar 44100 -f mp3 "${audioPath}" -loglevel error`
+        await execPromise(ffmpegCmd, { timeout: 300000 })
+        console.log(`✅ 本地音频提取成功: ${audioPath}`)
+        return { audioPath, videoPath }
+      } catch (dlError) {
+        console.error('视频下载或音频提取失败:', dlError.message)
+        if (fs.existsSync(videoPath)) {
+          try { fs.unlinkSync(videoPath) } catch {}
+        }
+        return { audioPath: null, videoPath: '' }
+      }
+    }
+    return { audioPath: null, videoPath: '' }
   }
 }
 
@@ -355,24 +596,24 @@ function detectVideoType(title, description, duration) {
 }
 
 // 智能转写路由（带降级方案）
-async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDuration, enableSpeakerDiarization) {
+async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDuration, enableSpeakerDiarization, fallbackUrl) {
   const videoType = detectVideoType(videoTitle, videoDescription, videoDuration)
   console.log(`📊 视频类型检测: ${videoType}`)
   
   // 音乐视频使用音乐模式
   if (videoType === 'music') {
     console.log('🎵 使用 Whisper 音乐模式')
-    const audioPath = await extractAudio(videoUrl)
+    const { audioPath, videoPath } = await extractAudio(videoUrl, fallbackUrl)
     if (!audioPath) {
       console.error('❌ 音频提取失败')
-      return { text: "", method: 'none', videoType }
+      return { text: "", method: 'none', videoType, videoPath: '' }
     }
     try {
       const text = await transcribeWithWhisper(audioPath, 'zh')
-      return { text: `[SINGER] ${text}`, utterances: [], method: 'whisper-music', videoType }
+      return { text: `[SINGER] ${text}`, utterances: [], method: 'whisper-music', videoType, videoPath }
     } catch (whisperError) {
       console.error('⚠️ Whisper 转写失败，使用降级方案:', whisperError.message)
-      return { text: "无法识别语音内容，请检查视频是否有清晰的对白", method: 'none', videoType }
+      return { text: "无法识别语音内容，请检查视频是否有清晰的对白", method: 'none', videoType, videoPath: '' }
     } finally {
       if (audioPath) cleanupTempFile(audioPath)
     }
@@ -380,33 +621,104 @@ async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDura
   
   // 默认使用 Whisper
   console.log('🎙️ 使用 Whisper')
-  const audioPath = await extractAudio(videoUrl)
+  const { audioPath, videoPath } = await extractAudio(videoUrl, fallbackUrl)
   if (!audioPath) {
     console.error('❌ 音频提取失败')
-    return { text: "", method: 'none', videoType }
+    return { text: "", method: 'none', videoType, videoPath: '' }
   }
   try {
     const text = await transcribeWithWhisper(audioPath, 'zh')
-    return { text, utterances: [], method: 'whisper', videoType }
+    return { text, utterances: [], method: 'whisper', videoType, videoPath }
   } catch (whisperError) {
     console.error('⚠️ Whisper 转写失败，使用降级方案:', whisperError.message)
-    return { text: "", method: 'none', videoType }
+    return { text: "", method: 'none', videoType, videoPath: '' }
   } finally {
     if (audioPath) cleanupTempFile(audioPath)
   }
 }
 
+// 抽帧（视频画面截图），优先使用本地视频文件
+async function extractFrames(videoUrl, duration, maxFrames = 8, localPath = '') {
+  if (!videoUrl && !localPath) return []
+  const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
+  const frameDir = path.join(tempDir, `frames_${tempId}`)
+  fs.mkdirSync(frameDir, { recursive: true })
+
+  const interval = Math.max(Math.floor(duration / maxFrames), 10)
+  const outputPattern = path.join(frameDir, 'frame_%03d.jpg')
+
+  const inputSource = localPath || videoUrl
+  console.log(`🎬 抽帧: ${localPath ? '本地文件' : 'URL'}, interval=${interval}s, ${maxFrames}帧`)
+
+  const cmd = `ffmpeg -y -i "${inputSource}" -vf "fps=1/${interval}" -vframes ${maxFrames} -q:v 2 "${outputPattern}" -loglevel error`
+
+  try {
+    await execPromise(cmd, { timeout: 120000 })
+    const files = fs.readdirSync(frameDir).filter(f => f.endsWith('.jpg')).sort()
+    console.log(`🎬 抽帧成功: ${files.length} 帧`)
+    return files.map(f => {
+      const data = fs.readFileSync(path.join(frameDir, f))
+      return `data:image/jpeg;base64,${data.toString('base64')}`
+    })
+  } catch (e) {
+    console.warn('⚠️ 抽帧失败:', e.message)
+    return []
+  } finally {
+    if (fs.existsSync(frameDir)) {
+      fs.readdirSync(frameDir).forEach(f => {
+        try { fs.unlinkSync(path.join(frameDir, f)) } catch {}
+      })
+      try { fs.rmdirSync(frameDir) } catch {}
+    }
+  }
+}
+
+// 统一本地视频处理管道（用于已下载的视频文件或本地上传）
+async function processLocalVideo(localPath, duration) {
+  console.log(`📦 处理本地视频: ${localPath}`)
+
+  // 1. 提取音频
+  const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
+  const audioPath = path.join(tempDir, `${tempId}.mp3`)
+  const ffmpegCmd = `ffmpeg -y -i "${localPath}" -vn -acodec libmp3lame -ab 128k -ar 44100 -f mp3 "${audioPath}" -loglevel error`
+  await execPromise(ffmpegCmd, { timeout: 300000 })
+  console.log(`✅ 本地音频提取成功: ${audioPath}`)
+
+  // 2. Whisper 转写
+  const text = await transcribeWithWhisper(audioPath, 'zh')
+  cleanupTempFile(audioPath)
+
+  // 3. 抽帧
+  const frames = await extractFrames('', duration, 8, localPath)
+
+  return { text, frames }
+}
+
 // AI 模型调用
-async function callAIModel(config, systemPrompt, userPrompt) {
+async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
   const { apiKey, baseUrl, model, maxTokens = 3000, temperature = 0.7 } = config
-  
+
   if (!apiKey) {
     throw new Error(`${model} 模型不可用`)
   }
 
   try {
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 120000)
+    const timeoutId = setTimeout(() => controller.abort(), 180000)
+
+    const messages = [
+      { role: 'system', content: systemPrompt }
+    ]
+
+    if (frames.length > 0) {
+      const content = [{ type: 'text', text: userPrompt }]
+      frames.forEach(frame => {
+        content.push({ type: 'image_url', image_url: { url: frame } })
+      })
+      messages.push({ role: 'user', content })
+    } else {
+      messages.push({ role: 'user', content: userPrompt })
+    }
 
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
@@ -416,13 +728,9 @@ async function callAIModel(config, systemPrompt, userPrompt) {
       },
       body: JSON.stringify({
         model: model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
+        messages,
         temperature: temperature,
-        max_tokens: maxTokens,
-        response_format: { type: 'json_object' }
+        max_tokens: maxTokens
       }),
       signal: controller.signal
     })
@@ -445,17 +753,19 @@ async function callAIModel(config, systemPrompt, userPrompt) {
     if (content.endsWith('```')) content = content.substring(0, content.length - 3)
     content = content.trim()
     
-    try {
-      return JSON.parse(content)
-    } catch (parseError) {
-      const jsonMatch = content.match(/\{[\s\S]*\}/)
-      if (jsonMatch) return JSON.parse(jsonMatch[0])
-      return {
-        summary: content.substring(0, 500) || '暂无摘要',
-        keyPoints: [],
-        topics: []
+      try {
+        return JSON.parse(content)
+      } catch (parseError) {
+        const jsonMatch = content.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          try {
+            return JSON.parse(jsonMatch[0])
+          } catch (e2) {
+            // 两次 JSON 解析均失败，返回原始内容
+          }
+        }
+        return { summary: content.substring(0, 500) || '暂无摘要', keyPoints: [], topics: [] }
       }
-    }
     
   } catch (error) {
     if (error.name === 'AbortError') throw new Error('请求超时')
@@ -507,8 +817,13 @@ function normalizeAnalysisResult(raw, context = {}) {
   const title = context.title || result.title || '视频'
   const summary = String(result.summary || result.overview || result.abstract || '').trim()
   let keyPoints = normalizeStringList(result.keyPoints || result.key_points || result.points || result.highlights)
-  const details = result.details && typeof result.details === 'object' ? result.details : {}
+  const details = result.details && typeof result.details === 'object'
+    ? Object.fromEntries(Object.entries(result.details).map(([k, v]) => [k, String(v).trim()]))
+    : {}
   const deepAnalysis = result.deepAnalysis || result.deep_analysis
+  const cleanedDeep = deepAnalysis && typeof deepAnalysis === 'object'
+    ? Object.fromEntries(Object.entries(deepAnalysis).map(([k, v]) => [k, String(v).trim()]))
+    : deepAnalysis
 
   if (keyPoints.length === 0) {
     keyPoints = normalizeStringList([
@@ -538,9 +853,9 @@ function normalizeAnalysisResult(raw, context = {}) {
     keyPoints: keyPoints.slice(0, 10),
     topics: topics.slice(0, 10),
     details,
-    deepAnalysis,
+    deepAnalysis: cleanedDeep,
     quotes: normalizeStringList(result.quotes),
-    keyTakeaway: result.keyTakeaway || ''
+    keyTakeaway: String(result.keyTakeaway || '').trim()
   }
 }
 
@@ -578,7 +893,7 @@ function getModelConfig(modelType) {
       apiKey: BAILIAN_API_KEY,
       baseUrl: BAILIAN_BASE_URL,
       model: BAILIAN_MODEL_PRO,
-      maxTokens: 2000,
+      maxTokens: 2000, // tongyi-xiaomi-analysis-pro 上限 2000
       temperature: 0.75,
       requiresVip: true,
       systemPrompt: `你是资深视频内容分析师、知识提炼专家和批判性思维教练。你的分析要比普通AI深一个层次——不只复述内容，而是解构、连接、提炼底层逻辑。
@@ -588,7 +903,7 @@ function getModelConfig(modelType) {
 只返回纯 JSON，不要 Markdown：
 
 {
-  “summary”: “深度摘要，800-1200字。结构：1)【核心定位】用1-2句话点明视频的不可替代价值(50-80字)；2)【背景与问题】为什么这个话题重要，当前共识和争议是什么(100-150字)；3)【内容深度解析】按逻辑链条分2-3段展开核心内容，每段指出关键论证、支撑证据和隐含假设(400-500字)；4)【反思与延伸】指出视频中未被充分讨论的角度、可进一步探索的方向(150-200字)；5)【一句话总结】提炼最值得记住的洞察(50字)。”,
+  “summary”: “深度摘要，800-1200字。结构：先用1-2句话点明视频的不可替代价值(50-80字)；接着说明为什么这个话题重要，当前共识和争议是什么(100-150字)；然后按逻辑链条分2-3段展开核心内容，每段指出关键论证、支撑证据和隐含假设(400-500字)；再指出视频中未被充分讨论的角度、可进一步探索的方向(150-200字)；最后提炼最值得记住的洞察(50字)。”,
 
   “keyPoints”: [
     “🎯 核心论点：完整阐述视频的中心论点和论证链条，包括前提→推理→结论(80-120字)”,
@@ -641,6 +956,39 @@ function getModelConfig(modelType) {
   return modelConfigs[modelType]
 }
 
+// 双通道分析（文字+画面）
+async function analyzeWithFrames(title, content, videoUrl, frames, modelType = 'recommended') {
+  const config = getModelConfig(modelType)
+  if (!config) throw new Error(`未知的模型类型: ${modelType}`)
+  
+  const vlModel = modelType === 'fastest' ? BAILIAN_MODEL_VL_LITE : BAILIAN_MODEL_VL
+  console.log(`🎬 双通道分析: ${frames.length} 帧, 模型=${vlModel}`)
+
+  const vlConfig = {
+    apiKey: BAILIAN_API_KEY,
+    baseUrl: BAILIAN_BASE_URL,
+    model: vlModel,
+    maxTokens: modelType === 'fastest' ? 2000 : 6000,
+    temperature: 0.7
+  }
+
+  const systemPrompt = `你是资深视频内容分析师，拥有视觉理解能力。你会同时收到视频的【文字内容（字幕/语音转写）】和【视频画面截图】。
+你需要结合两者进行分析：文字提供对话、术语和数据，画面提供图表、表情、实物演示、PPT、场景氛围等视觉信息。
+
+分析要求：
+1. 优先使用文字内容提取核心观点和论证逻辑
+2. 利用画面截图补充视觉信息：图表内容、人物表情、场景变化、实物展示、屏幕录制内容等
+3. 如果文字和画面信息有冲突或互补，在分析中明确指出
+4. 特别注意画面中的文字信息（PPT、白板、字幕等）
+
+只返回纯 JSON，不要 Markdown，格式与 text-only 分析完全一致。`
+
+  const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n【文字内容（字幕/语音转写）】\n${content?.substring(0, 24000) || '无文字内容'}\n\n【视频画面截图说明】\n以下每张截图按时间顺序排列，请分析其中的视觉信息并与文字内容结合。`
+
+  const raw = await callAIModel(vlConfig, systemPrompt, userPrompt, frames)
+  return normalizeAnalysisResult(raw, { title, videoUrl })
+}
+
 async function analyzeWithModel(title, content, videoUrl, modelType = 'recommended') {
   const config = getModelConfig(modelType)
   if (!config) throw new Error(`未知的模型类型: ${modelType}`)
@@ -671,11 +1019,16 @@ function formatDuration(seconds) {
 module.exports = {
   getBeijingTime,
   getVideoInfo,
+  getXiaohongshuVideoInfo,
+  isXiaohongshuUrl,
   extractSubtitles,
   extractAudio,
   smartTranscribe,
   analyzeWithModel,
+  analyzeWithFrames,
   analyzeWithoutContent,
+  extractFrames,
   formatDuration,
-  cleanupTempFile
+  cleanupTempFile,
+  processLocalVideo
 }

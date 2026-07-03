@@ -1,0 +1,29 @@
+[
+  {
+    "name": "a1",
+    "value": "",
+    "domain": ".xiaohongshu.com",
+    "path": "/",
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "webId",
+    "value": "",
+    "domain": ".xiaohongshu.com",
+    "path": "/",
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "web_session",
+    "value": "",
+    "domain": ".xiaohongshu.com",
+    "path": "/",
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Lax"
+  }
+]

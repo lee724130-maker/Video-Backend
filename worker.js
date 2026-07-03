@@ -1,12 +1,15 @@
 const { videoQueue } = require('./queue')
 const pool = require('./db')
+const fs = require('fs')
 const {
   getBeijingTime,
   getVideoInfo,
   extractSubtitles,
   smartTranscribe,
   analyzeWithModel,
+  analyzeWithFrames,
   analyzeWithoutContent,
+  extractFrames,
   formatDuration,
   cleanupTempFile
 } = require('./videoProcessor')
@@ -27,17 +30,42 @@ videoQueue.process('parse-video', 1, async (job) => {
     } catch (e) {}
 
     if (!videoContent) {
-      const transcribeResult = await smartTranscribe(url, videoInfo.title, videoInfo.description, videoInfo.duration, enableSpeakerDiarization)
+      const transcribeResult = await smartTranscribe(url, videoInfo.title, videoInfo.description, videoInfo.duration, enableSpeakerDiarization, videoInfo.video_url)
       videoContent = transcribeResult
       contentMethod = transcribeResult.method
     }
 
+    const contentText = videoContent && typeof videoContent === 'object' ? videoContent.text : (videoContent || '')
+
     let analysisResult
-    if (videoContent) {
-      const contentText = typeof videoContent === 'object' ? videoContent.text : videoContent
-      analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+    const localVideoPath = videoContent?.videoPath || ''
+
+    let frames = []
+    if (localVideoPath) {
+      console.log(`🎬 从本地文件抽帧: ${localVideoPath}`)
+      frames = await extractFrames('', videoInfo.duration, 8, localVideoPath)
+      console.log(`🎬 抽帧结果: ${frames.length} 帧`)
+    } else if (videoInfo.video_url) {
+      console.log(`🎬 从直链抽帧: ${videoInfo.video_url?.substring(0, 50)}...`)
+      frames = await extractFrames(videoInfo.video_url, videoInfo.duration, 8)
+      console.log(`🎬 抽帧结果: ${frames.length} 帧`)
     } else {
-      analysisResult = await analyzeWithoutContent(videoInfo.title, videoInfo.description, url, model)
+      console.log(`⏭️ 跳过抽帧: 无视频来源`)
+    }
+
+    if (frames.length > 0) {
+      try {
+        analysisResult = await analyzeWithFrames(videoInfo.title, contentText, url, frames, model)
+      } catch (e) {
+        console.warn('⚠️ 双通道分析失败，回退到文字分析:', e.message)
+        analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+      }
+    } else {
+      analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+    }
+
+    if (localVideoPath) {
+      try { fs.unlinkSync(localVideoPath) } catch {}
     }
 
     const resultData = {
@@ -46,6 +74,7 @@ videoQueue.process('parse-video', 1, async (job) => {
       title: videoInfo.title,
       thumbnail: videoInfo.thumbnail,
       duration: formatDuration(videoInfo.duration),
+      video_url: videoInfo.video_url || '',
       topics: analysisResult.topics,
       details: analysisResult.details || {},
       deepAnalysis: analysisResult.deepAnalysis || null,
@@ -54,7 +83,9 @@ videoQueue.process('parse-video', 1, async (job) => {
       contentMethod: contentMethod,
       language: language,
       dialogues: videoContent?.utterances || [],
-      videoType: videoContent?.videoType || 'unknown'
+      videoType: videoContent?.videoType || 'unknown',
+      webpage_url: videoInfo.webpage_url || '',
+      source_url: job.data.url || ''
     }
 
     const processingTime = Math.floor((Date.now() - taskStartTime) / 1000)
