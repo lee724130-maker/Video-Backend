@@ -58,10 +58,20 @@ videoQueue.process('parse-video', 1, async (job) => {
         analysisResult = await analyzeWithFrames(videoInfo.title, contentText, url, frames, model)
       } catch (e) {
         console.warn('⚠️ 双通道分析失败，回退到文字分析:', e.message)
-        analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+        try {
+          analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+        } catch (e2) {
+          console.warn('⚠️ 文字分析也失败，切换到备用模型:', e2.message)
+          analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, 'fastest')
+        }
       }
     } else {
-      analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+      try {
+        analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+      } catch (e) {
+        console.warn('⚠️ 文字分析也失败，切换到备用模型:', e.message)
+        analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, 'fastest')
+      }
     }
 
     if (localVideoPath) {

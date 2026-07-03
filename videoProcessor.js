@@ -503,10 +503,18 @@ async function transcribeWithWhisper(audioPath, language = 'zh', modelName = 'ti
 import sys
 import json
 try:
-    import whisper
+    from faster_whisper import WhisperModel
 except ImportError:
-    print(json.dumps({"error": "Whisper not installed"}))
-    sys.exit(1)
+    try:
+        import whisper
+        _HAS_WHISPER = True
+        _HAS_FASTER = False
+    except ImportError:
+        print(json.dumps({"error": "Neither faster-whisper nor openai-whisper installed"}))
+        sys.exit(1)
+else:
+    _HAS_WHISPER = False
+    _HAS_FASTER = True
 
 def main():
     if len(sys.argv) < 3:
@@ -518,9 +526,15 @@ def main():
     language = sys.argv[3] if len(sys.argv) > 3 else None
 
     try:
-        model = whisper.load_model(model_name)
-        result = model.transcribe(audio_path, language=language if language != "auto" else None)
-        print(json.dumps({"text": result["text"], "language": result["language"]}))
+        if _HAS_FASTER:
+            model = WhisperModel(model_name, device="cpu", compute_type="int8")
+            segments, info = model.transcribe(audio_path, language=language if language != "auto" else None)
+            text = " ".join([seg.text for seg in segments])
+            print(json.dumps({"text": text, "language": info.language}))
+        else:
+            model = whisper.load_model(model_name)
+            result = model.transcribe(audio_path, language=language if language != "auto" else None)
+            print(json.dumps({"text": result["text"], "language": result["language"]}))
     except Exception as e:
         print(json.dumps({"error": str(e)}))
         sys.exit(1)
@@ -1059,14 +1073,16 @@ async function analyzeWithModel(title, content, videoUrl, modelType = 'recommend
   if (!config) throw new Error(`未知的模型类型: ${modelType}`)
   const hasContent = content && content.length > 10
   let systemPrompt = config.systemPrompt
-  if (!hasContent) {
-    systemPrompt = `你只能根据标题和信息推断视频内容。必须明确写“基于有限信息推断”。\n\n重要限制：没有可用的文字内容（字幕/语音转写失败），禁止编造具体数字、比分、人名等无法确认的细节。\n\n格式要求与标准分析完全一致：返回完整 JSON，包含 summary、keyPoints、topics、details、deepAnalysis、quotes。\n- keyPoints 至少3条，每条标注"（基于有限信息）"\n- 宁可简短诚实，不要编造虚假信息`
+  let userPrompt
+  if (!hasContent && modelType === 'recommended') {
+    systemPrompt = `你只能根据标题和信息推断视频内容。必须明确写\u201c基于有限信息推断\u201d。\n\n重要限制：没有可用的文字内容（字幕/语音转写失败），禁止编造具体数字、比分、人名等无法确认的细节。\n\n格式要求与标准分析完全一致：返回完整 JSON，包含 summary、keyPoints、topics、details、deepAnalysis、quotes。\n- keyPoints 至少3条，每条标注\u201c（基于有限信息）\u201d\n- 宁可简短诚实，不要编造虚假信息`
+    userPrompt = `视频标题：${title}\n视频链接：${videoUrl}`
+  } else {
+    userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n可用内容：\n${content?.substring(0, 24000) || '无正文内容，请基于标题和上下文推断。'}`
   }
-  const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n可用内容：\n${content?.substring(0, 24000) || '无正文内容，请基于标题和上下文推断，但必须标注“基于有限信息推断”。'}`
   const raw = await callAIModel(config, systemPrompt, userPrompt)
   return normalizeAnalysisResult(raw, { title, videoUrl })
 }
-
 async function analyzeWithoutContent(title, description, videoUrl, modelType = 'recommended') {
   console.log(`使用备用分析方案，模型: ${modelType}`)
   const config = getModelConfig(modelType)
