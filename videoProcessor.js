@@ -581,17 +581,23 @@ function detectVideoType(title, description, duration) {
   
   const interviewKeywords = ['访谈', '对话', '采访', '讨论', '座谈', '圆桌', '嘉宾', '主持', 'talk', 'interview', 'podcast', 'panel', 'discussion']
   const musicKeywords = ['唱', '歌', '音乐', '歌曲', '演唱', 'live', '现场', '录音棚', '专辑', '单曲', 'MV', 'remix', 'cover']
+  const sportsKeywords = ['比赛', '进球', '集锦', '世界杯', '欧冠', '英超', '西甲', 'nba', '奥运', '冠军', '决赛', 'vs', '比分', '点球', '红牌', '射门', '足球', '篮球', '体育', '全场', '集锦', '锦集', '高光']
   
   let interviewScore = 0
   let musicScore = 0
+  let sportsScore = 0
   
   interviewKeywords.forEach(kw => { if (text.includes(kw)) interviewScore++ })
   musicKeywords.forEach(kw => { if (text.includes(kw)) musicScore++ })
+  sportsKeywords.forEach(kw => { if (text.includes(kw)) sportsScore++ })
   
-  if (duration && duration < 600) musicScore += 0.5
-  
+  // 体育赛事优先识别，走默认转录路径（非音乐模式）
+  if (sportsScore > 0) return 'sports'
+
+  if (duration && duration < 600 && musicScore > 0) musicScore += 0.5
+
   if (interviewScore > 0 && interviewScore >= musicScore) return 'interview'
-  if (musicScore > 0) return 'music'
+  if (musicScore >= 1) return 'music'
   return 'tutorial'
 }
 
