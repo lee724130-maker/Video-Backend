@@ -10,6 +10,8 @@ const {
   analyzeWithFrames,
   analyzeWithoutContent,
   extractFrames,
+  extractSceneFrames,
+  transcribeAudioWithOmni,
   formatDuration,
   cleanupTempFile
 } = require('./videoProcessor')
@@ -23,45 +25,58 @@ videoQueue.process('parse-video', 1, async (job) => {
   try {
     let videoContent = null
     let contentMethod = 'none'
+    let transcript = ''
 
+    // 1. 字幕提取
     try {
       videoContent = await extractSubtitles(url)
       if (videoContent) contentMethod = 'subtitle'
     } catch (e) {}
 
+    // 2. 音频提取（跳过本地 Whisper，提取路径供云端转写）
     if (!videoContent) {
       const transcribeResult = await smartTranscribe(url, videoInfo.title, videoInfo.description, videoInfo.duration, enableSpeakerDiarization, videoInfo.video_url)
       videoContent = transcribeResult
       contentMethod = transcribeResult.method
     }
 
-    const contentText = videoContent && typeof videoContent === 'object' ? videoContent.text : (videoContent || '')
-
-    let analysisResult
     const localVideoPath = videoContent?.videoPath || ''
 
+    // 3. 场景检测抽帧（有本地视频则从本地，否则从直链）
     let frames = []
     if (localVideoPath) {
-      console.log(`🎬 从本地文件抽帧: ${localVideoPath}`)
-      frames = await extractFrames('', videoInfo.duration, 8, localVideoPath)
-      console.log(`🎬 抽帧结果: ${frames.length} 帧`)
+      console.log(`🎬 场景检测抽帧: ${localVideoPath}`)
+      frames = await extractSceneFrames(localVideoPath, 5)
     } else if (videoInfo.video_url) {
       console.log(`🎬 从直链抽帧: ${videoInfo.video_url?.substring(0, 50)}...`)
       frames = await extractFrames(videoInfo.video_url, videoInfo.duration, 8)
-      console.log(`🎬 抽帧结果: ${frames.length} 帧`)
     } else {
       console.log(`⏭️ 跳过抽帧: 无视频来源`)
     }
+    console.log(`🎬 抽帧结果: ${frames.length} 帧`)
 
+    // 4. 云端音频转写（当字幕和 Whisper 都未提供内容时）
+    const contentText = videoContent && typeof videoContent === 'object' ? videoContent.text : (videoContent || '')
+    if (!contentText && videoContent?.audioPath) {
+      console.log('🎙️ 使用云端 Omni 转写音频...')
+      transcript = await transcribeAudioWithOmni(videoContent.audioPath)
+      contentMethod = transcript ? 'omni-transcribe' : 'none'
+      cleanupTempFile(videoContent.audioPath)
+    }
+
+    const finalContent = transcript || contentText
+
+    // 5. 分析
+    let analysisResult
     if (frames.length > 0) {
       try {
-        analysisResult = await analyzeWithFrames(videoInfo.title, contentText, url, frames, model)
+        analysisResult = await analyzeWithFrames(videoInfo.title, finalContent, url, frames, model)
       } catch (e) {
-        console.warn('⚠️ 双通道分析失败，回退到文字分析:', e.message)
-        analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+        console.warn('⚠️ 全模态分析失败，回退到文字分析:', e.message)
+        analysisResult = await analyzeWithModel(videoInfo.title, finalContent, url, model)
       }
     } else {
-      analysisResult = await analyzeWithModel(videoInfo.title, contentText, url, model)
+      analysisResult = await analyzeWithModel(videoInfo.title, finalContent, url, model)
     }
 
     if (localVideoPath) {

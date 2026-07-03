@@ -17,6 +17,9 @@ const BAILIAN_MODEL_PRO = process.env.BAILIAN_MODEL_PRO || 'tongyi-xiaomi-analys
 const BAILIAN_MODEL_FLASH = process.env.BAILIAN_MODEL_FLASH || 'tongyi-xiaomi-analysis-flash'
 const BAILIAN_MODEL_VL = process.env.BAILIAN_MODEL_VL || 'qwen2.5-vl-72b-instruct'
 const BAILIAN_MODEL_VL_LITE = process.env.BAILIAN_MODEL_VL_LITE || 'qwen2.5-vl-7b-instruct'
+const BAILIAN_MODEL_OMNI = process.env.BAILIAN_MODEL_OMNI || 'qwen3.5-omni-plus-2026-03-15'
+const BAILIAN_MODEL_OMNI_FLASH = process.env.BAILIAN_MODEL_OMNI_FLASH || 'qwen3-omni-flash'
+const BAILIAN_MODEL_VL_NEW = process.env.BAILIAN_MODEL_VL_NEW || 'qwen3-vl-30b-a3b-thinking'
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com'
 const DOUBAO_API_KEY = process.env.DOUBAO_API_KEY
@@ -601,46 +604,19 @@ function detectVideoType(title, description, duration) {
   return 'tutorial'
 }
 
-// 智能转写路由（带降级方案）
+// 智能转写路由 — 跳过本地 Whisper，使用云端 API 转写
 async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDuration, enableSpeakerDiarization, fallbackUrl) {
   const videoType = detectVideoType(videoTitle, videoDescription, videoDuration)
   console.log(`📊 视频类型检测: ${videoType}`)
-  
-  // 音乐视频使用音乐模式
-  if (videoType === 'music') {
-    console.log('🎵 使用 Whisper 音乐模式')
-    const { audioPath, videoPath } = await extractAudio(videoUrl, fallbackUrl)
-    if (!audioPath) {
-      console.error('❌ 音频提取失败')
-      return { text: "", method: 'none', videoType, videoPath: '' }
-    }
-    try {
-      const text = await transcribeWithWhisper(audioPath, 'zh')
-      return { text: `[SINGER] ${text}`, utterances: [], method: 'whisper-music', videoType, videoPath }
-    } catch (whisperError) {
-      console.error('⚠️ Whisper 转写失败，使用降级方案:', whisperError.message)
-      return { text: "无法识别语音内容，请检查视频是否有清晰的对白", method: 'none', videoType, videoPath: '' }
-    } finally {
-      if (audioPath) cleanupTempFile(audioPath)
-    }
-  }
-  
-  // 默认使用 Whisper
-  console.log('🎙️ 使用 Whisper')
+
+  // 只提取音频路径供后续转写，不做本地 Whisper
   const { audioPath, videoPath } = await extractAudio(videoUrl, fallbackUrl)
   if (!audioPath) {
     console.error('❌ 音频提取失败')
     return { text: "", method: 'none', videoType, videoPath: '' }
   }
-  try {
-    const text = await transcribeWithWhisper(audioPath, 'zh')
-    return { text, utterances: [], method: 'whisper', videoType, videoPath }
-  } catch (whisperError) {
-    console.error('⚠️ Whisper 转写失败，使用降级方案:', whisperError.message)
-    return { text: "", method: 'none', videoType, videoPath: '' }
-  } finally {
-    if (audioPath) cleanupTempFile(audioPath)
-  }
+  console.log(`🎵 音频已提取: ${audioPath}`)
+  return { text: "", audioPath, method: 'none', videoType, videoPath }
 }
 
 // 抽帧（视频画面截图），优先使用本地视频文件
@@ -698,6 +674,127 @@ async function processLocalVideo(localPath, duration) {
   const frames = await extractFrames('', duration, 8, localPath)
 
   return { text, frames }
+}
+
+// 场景检测抽帧 — 提取画面切换点的关键帧
+async function extractSceneFrames(videoPath, maxFrames = 5) {
+  const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
+  const frameDir = path.join(tempDir, `scenes_${tempId}`)
+  fs.mkdirSync(frameDir, { recursive: true })
+  const outputPattern = path.join(frameDir, 'scene_%03d.jpg')
+
+  const cmd = `ffmpeg -i "${videoPath}" -vf "select=gt(scene\\,0.3),showinfo" -vsync vfr -q:v 2 "${outputPattern}" -loglevel error`
+  try {
+    await execPromise(cmd, { timeout: 120000 })
+    const allFiles = fs.readdirSync(frameDir).filter(f => f.endsWith('.jpg')).sort()
+    let selected = allFiles
+    if (allFiles.length > maxFrames) {
+      const step = allFiles.length / maxFrames
+      selected = allFiles.filter((_, i) => Math.floor(i % step) === 0).slice(0, maxFrames)
+    }
+    console.log(`🎬 场景检测抽帧: ${selected.length} 帧 (共 ${allFiles.length} 个场景)`)
+    const frames = selected.map(f => {
+      const data = fs.readFileSync(path.join(frameDir, f))
+      return `data:image/jpeg;base64,${data.toString('base64')}`
+    })
+    fs.readdirSync(frameDir).forEach(f => { try { fs.unlinkSync(path.join(frameDir, f)) } catch {} })
+    try { fs.rmdirSync(frameDir) } catch {}
+    return frames
+  } catch (e) {
+    console.warn('⚠️ 场景检测抽帧失败:', e.message)
+    if (fs.existsSync(frameDir)) {
+      fs.readdirSync(frameDir).forEach(f => { try { fs.unlinkSync(path.join(frameDir, f)) } catch {} })
+      try { fs.rmdirSync(frameDir) } catch {}
+    }
+    return []
+  }
+}
+
+// 压缩音频到低码率（8kbps, 16kHz, 单声道）
+async function compressAudio(audioPath) {
+  const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
+  const compressedPath = path.join(tempDir, `${tempId}_compressed.mp3`)
+  const cmd = `ffmpeg -y -i "${audioPath}" -ac 1 -ar 16000 -ab 8k -f mp3 "${compressedPath}" -loglevel error`
+  try {
+    await execPromise(cmd, { timeout: 60000 })
+    console.log(`🔊 音频压缩完成: ${compressedPath}`)
+    return compressedPath
+  } catch (e) {
+    console.error('❌ 音频压缩失败:', e.message)
+    return null
+  }
+}
+
+// 用 qwen3-omni-flash 转写音频（分批并行）
+async function transcribeAudioWithOmni(audioPath) {
+  const compressedPath = await compressAudio(audioPath)
+  if (!compressedPath) return ''
+
+  // 获取音频时长(秒)
+  let duration = 0
+  try {
+    const { stdout } = await execPromise(`ffprobe -i "${compressedPath}" -show_entries format=duration -v quiet -of csv="p=0"`, { timeout: 10000 })
+    duration = Math.ceil(parseFloat(stdout.trim()))
+  } catch {}
+  if (duration <= 0) {
+    cleanupTempFile(compressedPath)
+    return ''
+  }
+
+  // 按3分钟分段
+  const chunkDuration = 180
+  const numChunks = Math.ceil(duration / chunkDuration)
+  const chunkDir = path.join(tempDir, `chunks_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`)
+  fs.mkdirSync(chunkDir, { recursive: true })
+
+  const splitCmd = `ffmpeg -y -i "${compressedPath}" -f segment -segment_time ${chunkDuration} -c copy "${path.join(chunkDir, 'chunk_%03d.mp3')}" -loglevel error`
+  try {
+    await execPromise(splitCmd, { timeout: 60000 })
+  } catch (e) {
+    console.error('❌ 音频分割失败:', e.message)
+    cleanupTempFile(compressedPath)
+    if (fs.existsSync(chunkDir)) { try { fs.rmdirSync(chunkDir, { recursive: true }) } catch {} }
+    return ''
+  }
+
+  const files = fs.readdirSync(chunkDir).filter(f => f.endsWith('.mp3')).sort()
+  console.log(`🔊 音频转写: ${files.length} 段, 共 ${duration}s`)
+
+  const results = await Promise.all(files.map(async (file, i) => {
+    const filePath = path.join(chunkDir, file)
+    const b64 = fs.readFileSync(filePath).toString('base64')
+    const messages = [{
+      role: 'user',
+      content: [
+        { type: 'input_audio', input_audio: { data: `data:audio/mp3;base64,${b64}`, format: 'mp3' } },
+        { type: 'text', text: '请逐字转录这段音频的中文内容，保留原话不要总结。' }
+      ]
+    }]
+    try {
+      const resp = await fetch(`${BAILIAN_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BAILIAN_API_KEY}` },
+        body: JSON.stringify({ model: BAILIAN_MODEL_OMNI_FLASH, messages, modalities: ['text'], max_tokens: 3000 })
+      })
+      if (!resp.ok) { console.error(`❌ 音频段 ${i+1} 转录失败: ${resp.status}`); return '' }
+      const data = await resp.json()
+      const text = data.choices[0].message.content
+      console.log(`✅ 音频段 ${i+1}/${files.length} 转录: ${text.length}字`)
+      return text
+    } catch (e) {
+      console.error(`❌ 音频段 ${i+1} 异常:`, e.message)
+      return ''
+    }
+  }))
+
+  const fullText = results.filter(Boolean).join('\n').trim()
+  console.log(`📝 完整逐字稿: ${fullText.length} 字`)
+
+  // 清理
+  cleanupTempFile(compressedPath)
+  if (fs.existsSync(chunkDir)) { try { fs.rmdirSync(chunkDir, { recursive: true }) } catch {} }
+
+  return fullText
 }
 
 // AI 模型调用
@@ -990,23 +1087,25 @@ function getModelConfig(modelType) {
   return modelConfigs[modelType]
 }
 
-// 双通道分析（文字+画面）
+// 双通道分析（文字+画面），使用全模态模型
 async function analyzeWithFrames(title, content, videoUrl, frames, modelType = 'recommended') {
   const config = getModelConfig(modelType)
   if (!config) throw new Error(`未知的模型类型: ${modelType}`)
-  
-  const vlModel = modelType === 'fastest' ? BAILIAN_MODEL_VL_LITE : BAILIAN_MODEL_VL
-  console.log(`🎬 双通道分析: ${frames.length} 帧, 模型=${vlModel}`)
+
+  const vlModel = modelType === 'fastest' ? BAILIAN_MODEL_OMNI_FLASH : BAILIAN_MODEL_OMNI
+  console.log(`🎬 全模态分析: ${frames.length} 帧, 模型=${vlModel}`)
 
   const vlConfig = {
     apiKey: BAILIAN_API_KEY,
     baseUrl: BAILIAN_BASE_URL,
     model: vlModel,
-    maxTokens: modelType === 'fastest' ? 2000 : 6000,
+    maxTokens: modelType === 'fastest' ? 3000 : 8000,
     temperature: 0.7
   }
 
-  const systemPrompt = `你是资深视频内容分析师，拥有视觉理解能力。你会同时收到视频的【文字内容（字幕/语音转写）】和【视频画面截图】。
+  const hasTranscript = content && content.trim().length > 10
+  const systemPrompt = hasTranscript
+    ? `你是资深视频内容分析师，拥有视觉理解能力。你会同时收到视频的【完整逐字稿】和【视频画面截图】。
 你需要结合两者进行分析：文字提供对话、术语和数据，画面提供图表、表情、实物演示、PPT、场景氛围等视觉信息。
 
 分析要求：
@@ -1018,8 +1117,12 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
 6. 📊 比分和赛果必须交叉验证：文字描述的比分/结果需要与画面中的记分牌或庆祝画面比对，不一致时以画面为准并标注差异
 
 只返回纯 JSON，不要 Markdown，格式与 text-only 分析完全一致。`
+    : `你是资深视频内容分析师，拥有视觉理解能力。你只能看到【视频画面截图】和标题。
+禁止编造具体细节，基于画面内容合理分析。
 
-  const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n【文字内容（字幕/语音转写）】\n${content?.substring(0, 24000) || '无文字内容'}\n\n【视频画面截图说明】\n以下每张截图按时间顺序排列，请分析其中的视觉信息并与文字内容结合。`
+只返回纯 JSON，不要 Markdown，格式与标准分析完全一致。`
+
+  const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n${hasTranscript ? `【完整逐字稿】\n${content.substring(0, 30000)}` : '【无逐字稿，仅依据画面截图分析】'}`
 
   const raw = await callAIModel(vlConfig, systemPrompt, userPrompt, frames)
   return normalizeAnalysisResult(raw, { title, videoUrl })
@@ -1064,6 +1167,8 @@ module.exports = {
   analyzeWithFrames,
   analyzeWithoutContent,
   extractFrames,
+  extractSceneFrames,
+  transcribeAudioWithOmni,
   formatDuration,
   cleanupTempFile,
   processLocalVideo
