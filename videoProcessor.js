@@ -720,18 +720,23 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
       messages.push({ role: 'user', content: userPrompt })
     }
 
+    const requestBody = {
+      model: model,
+      messages,
+      temperature: temperature,
+      max_tokens: maxTokens
+    }
+    // 文本请求启用 JSON 模式，VL 模型不支持此参数
+    if (frames.length === 0) {
+      requestBody.response_format = { type: 'json_object' }
+    }
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`
       },
-      body: JSON.stringify({
-        model: model,
-        messages,
-        temperature: temperature,
-        max_tokens: maxTokens
-      }),
+      body: JSON.stringify(requestBody),
       signal: controller.signal
     })
 
@@ -812,17 +817,40 @@ function pointsFromSummary(summary, title) {
   return points
 }
 
+// 递归展平 JSON 字符串字段：如果字段值是 JSON 字符串，解析并提取
+function tryParseField(value, depth = 0) {
+  if (depth > 3) return value
+  if (typeof value !== 'string') return value
+  const trimmed = value.trim()
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (typeof parsed === 'object') {
+        // 如果是对象，提取其 summary/overview 字段，或递归展平
+        if (parsed.summary || parsed.overview || parsed.abstract) {
+          return tryParseField(parsed.summary || parsed.overview || parsed.abstract, depth + 1)
+        }
+        return parsed
+      }
+    } catch {}
+  }
+  return value
+}
+
 function normalizeAnalysisResult(raw, context = {}) {
   const result = raw && typeof raw === 'object' ? raw : {}
   const title = context.title || result.title || '视频'
-  const summary = String(result.summary || result.overview || result.abstract || '').trim()
+  // 递归展平 summary，防止双层 JSON
+  const rawSummary = tryParseField(result.summary || result.overview || result.abstract || '')
+  const summary = (typeof rawSummary === 'object' ? (rawSummary.summary || rawSummary.overview || '') : String(rawSummary)).trim()
   let keyPoints = normalizeStringList(result.keyPoints || result.key_points || result.points || result.highlights)
   const details = result.details && typeof result.details === 'object'
-    ? Object.fromEntries(Object.entries(result.details).map(([k, v]) => [k, String(v).trim()]))
+    ? Object.fromEntries(Object.entries(result.details).map(([k, v]) => [k, String(tryParseField(v)).trim()]))
     : {}
   const deepAnalysis = result.deepAnalysis || result.deep_analysis
   const cleanedDeep = deepAnalysis && typeof deepAnalysis === 'object'
-    ? Object.fromEntries(Object.entries(deepAnalysis).map(([k, v]) => [k, String(v).trim()]))
+    ? Object.fromEntries(Object.entries(deepAnalysis).map(([k, v]) => [k, String(tryParseField(v)).trim()]))
     : deepAnalysis
 
   if (keyPoints.length === 0) {
@@ -980,6 +1008,8 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
 2. 利用画面截图补充视觉信息：图表内容、人物表情、场景变化、实物展示、屏幕录制内容等
 3. 如果文字和画面信息有冲突或互补，在分析中明确指出
 4. 特别注意画面中的文字信息（PPT、白板、字幕等）
+5. ⛔ 事实核查：当文字内容提到具体比分、进球、红牌、点球等具体事实时，必须检查画面截图是否能佐证。如果画面无法佐证，请标注"（待核实）"
+6. 📊 比分和赛果必须交叉验证：文字描述的比分/结果需要与画面中的记分牌或庆祝画面比对，不一致时以画面为准并标注差异
 
 只返回纯 JSON，不要 Markdown，格式与 text-only 分析完全一致。`
 
