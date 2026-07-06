@@ -1036,7 +1036,8 @@ app.post('/api/app/parse', authenticateAppUser, async (req, res) => {
     }
 
     // 2. 获取视频基本信息（非必须——worker 会用 ffprobe 补全）
-    let videoInfo = { title: '解析中…', duration: 0, thumbnail: '', uploader: '', description: '', video_url: '', webpage_url: url }
+    const fallbackTitle = url.replace(/https?:\/\//, '').replace(/\/[?#].*$/, '').replace(/^[^/]+\//, '').substring(0, 40) || '未知视频'
+    let videoInfo = { title: fallbackTitle, duration: 0, thumbnail: '', uploader: '', description: '', video_url: '', webpage_url: url }
     try {
       const info = await getVideoInfo(url)
       if (info) Object.assign(videoInfo, info)

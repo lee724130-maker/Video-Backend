@@ -619,7 +619,7 @@ async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDura
   return { text: "", audioPath, method: 'none', videoType, videoPath }
 }
 
-// 抽帧（视频画面截图），优先使用本地视频文件
+// 抽帧（视频画面截图），间隔抽帧 + 高质量
 async function extractFrames(videoUrl, duration, maxFrames = 8, localPath = '') {
   if (!videoUrl && !localPath) return []
   const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
@@ -632,7 +632,8 @@ async function extractFrames(videoUrl, duration, maxFrames = 8, localPath = '') 
   const inputSource = localPath || videoUrl
   console.log(`🎬 抽帧: ${localPath ? '本地文件' : 'URL'}, interval=${interval}s, ${maxFrames}帧`)
 
-  const cmd = `ffmpeg -y -i "${inputSource}" -vf "fps=1/${interval}" -vframes ${maxFrames} -q:v 2 "${outputPattern}" -loglevel error`
+  // -q:v 1 最高质量，-vsync vfr 避免重复帧
+  const cmd = `ffmpeg -y -i "${inputSource}" -vf "fps=1/${interval}" -vframes ${maxFrames} -q:v 1 -vsync vfr "${outputPattern}" -loglevel error`
 
   try {
     await execPromise(cmd, { timeout: 120000 })
@@ -829,8 +830,9 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
       temperature: temperature,
       max_tokens: maxTokens
     }
-    // 文本请求启用 JSON 模式，VL 模型不支持此参数
-    if (frames.length === 0) {
+    // omni 模型（qwen3.*-omni-*）支持 JSON 模式，即使带图片
+    // 只有 qwen2.5-vl-* VL 模型不支持此参数
+    if (frames.length === 0 || model.includes('omni')) {
       requestBody.response_format = { type: 'json_object' }
     }
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -853,28 +855,71 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
     }
 
     const data = await response.json()
-    let content = data.choices[0].message.content
-    
-    content = content.trim()
+    let content = data.choices[0]?.message?.content
+
+    if (!content && content !== '') {
+      content = JSON.stringify(data.choices[0]?.message || data)
+    }
+
+    if (Array.isArray(content)) {
+      content = content.find(c => c.type === 'text')?.text || JSON.stringify(content)
+    }
+
+    content = (content || '').trim()
     if (content.startsWith('```json')) content = content.substring(7)
     else if (content.startsWith('```')) content = content.substring(3)
+    // 移除尾部杂散字符（如单独的 ` 或 ```）
     if (content.endsWith('```')) content = content.substring(0, content.length - 3)
+    if (content.endsWith('`')) content = content.substring(0, content.length - 1)
     content = content.trim()
-    
-      try {
-        return JSON.parse(content)
-      } catch (parseError) {
-        const jsonMatch = content.match(/\{[\s\S]*\}/)
-        if (jsonMatch) {
+
+    try {
+      const parsed = JSON.parse(content)
+      // 检测并展平嵌套 JSON：如果 summary 字段的值本身是一个 JSON 字符串
+      // （omni 模型有时把整个分析对象打包成字符串塞进 summary 字段）
+      if (parsed && typeof parsed === 'object' && typeof parsed.summary === 'string') {
+        const trimmedSummary = parsed.summary.trim()
+        if (trimmedSummary.startsWith('{')) {
           try {
-            return JSON.parse(jsonMatch[0])
-          } catch (e2) {
-            // 两次 JSON 解析均失败，返回原始内容
-          }
+            const inner = JSON.parse(trimmedSummary)
+            if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+              // 用内层对象合并覆盖外层，保留外层中有而内层没有的字段
+              for (const key of Object.keys(inner)) {
+                if (inner[key] !== null && inner[key] !== undefined && !(Array.isArray(inner[key]) && inner[key].length === 0)) {
+                  parsed[key] = inner[key]
+                }
+              }
+            }
+          } catch {}
         }
-        return { summary: content.substring(0, 500) || '暂无摘要', keyPoints: [], topics: [] }
       }
-    
+      return parsed
+    } catch (parseError) {
+      const jsonMatch = content.match(/\{[\s\S]*\}/)
+      if (jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0])
+          // 同样展平嵌套
+          if (parsed && typeof parsed === 'object' && typeof parsed.summary === 'string' && parsed.summary.trim().startsWith('{')) {
+            try {
+              const inner = JSON.parse(parsed.summary.trim())
+              if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+                for (const key of Object.keys(inner)) {
+                  if (inner[key] !== null && inner[key] !== undefined && !(Array.isArray(inner[key]) && inner[key].length === 0)) {
+                    parsed[key] = inner[key]
+                  }
+                }
+              }
+            } catch {}
+          }
+          return parsed
+        } catch (e2) {
+          // 两次 JSON 解析均失败，返回原始内容
+        }
+      }
+      return { summary: content.substring(0, 500) || '暂无摘要', keyPoints: [], topics: [] }
+    }
+
   } catch (error) {
     if (error.name === 'AbortError') throw new Error('请求超时')
     throw error
@@ -944,14 +989,39 @@ function tryParseField(value, depth = 0) {
 function normalizeAnalysisResult(raw, context = {}) {
   const result = raw && typeof raw === 'object' ? raw : {}
   const title = context.title || result.title || '视频'
-  // 递归展平 summary，防止双层 JSON
-  const rawSummary = tryParseField(result.summary || result.overview || result.abstract || '')
+
+  // 检测 result.summary 是否包含嵌套 JSON（模型有时把整个分析塞进 summary 字段）
+  let inner = null
+  const rawSummaryField = result.summary || result.overview || result.abstract || ''
+  if (typeof rawSummaryField === 'string') {
+    try {
+      const parsed = JSON.parse(rawSummaryField)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        inner = parsed  // 完整的内层分析对象
+      }
+    } catch {}
+  }
+
+  // 从内层或外层提取 summary
+  const rawSummary = inner ? inner.summary || inner.overview || '' : tryParseField(rawSummaryField)
   const summary = (typeof rawSummary === 'object' ? (rawSummary.summary || rawSummary.overview || '') : String(rawSummary)).trim()
+
+  // 决定使用内层还是外层数据：有内层且内层包含 keyPoints 时优先用内层
+  const useInner = inner && Array.isArray(inner.keyPoints)
+
   let keyPoints = normalizeStringList(result.keyPoints || result.key_points || result.points || result.highlights)
-  const details = result.details && typeof result.details === 'object'
-    ? Object.fromEntries(Object.entries(result.details).map(([k, v]) => [k, String(tryParseField(v)).trim()]))
-    : {}
-  const deepAnalysis = result.deepAnalysis || result.deep_analysis
+  const hasKeyPointsGarbage = keyPoints.length > 0 && keyPoints.some(k => k.trim().startsWith('{'))
+  if (keyPoints.length === 0 || hasKeyPointsGarbage) {
+    if (useInner) keyPoints = normalizeStringList(inner.keyPoints)
+  }
+
+  const details = useInner && inner.details
+    ? (typeof inner.details === 'object' ? inner.details : {})
+    : (result.details && typeof result.details === 'object'
+        ? Object.fromEntries(Object.entries(result.details).map(([k, v]) => [k, String(tryParseField(v)).trim()]))
+        : {})
+  const deepSource = useInner ? inner : result
+  const deepAnalysis = deepSource.deepAnalysis || deepSource.deep_analysis
   const cleanedDeep = deepAnalysis && typeof deepAnalysis === 'object'
     ? Object.fromEntries(Object.entries(deepAnalysis).map(([k, v]) => [k, String(tryParseField(v)).trim()]))
     : deepAnalysis
@@ -973,9 +1043,16 @@ function normalizeAnalysisResult(raw, context = {}) {
   }
 
   let topics = normalizeStringList(result.topics || result.tags || result.keywords)
+  const hasTopicsGarbage = topics.length > 0 && topics.some(t => t.trim().startsWith('{'))
+  if (topics.length === 0 || hasTopicsGarbage) {
+    if (useInner && inner.topics) topics = normalizeStringList(inner.topics)
+  }
   if (topics.length === 0) {
     topics = keyPoints.slice(0, 6).map(point => point.replace(/[，。！？].*$/, '').slice(0, 18)).filter(Boolean)
   }
+
+  const quotes = normalizeStringList(useInner ? (inner.quotes || result.quotes) : (result.quotes || []))
+  const keyTakeaway = String(useInner ? (inner.keyTakeaway || result.keyTakeaway || '') : (result.keyTakeaway || '')).trim()
 
   return {
     ...result,
@@ -985,8 +1062,8 @@ function normalizeAnalysisResult(raw, context = {}) {
     topics: topics.slice(0, 10),
     details,
     deepAnalysis: cleanedDeep,
-    quotes: normalizeStringList(result.quotes),
-    keyTakeaway: String(result.keyTakeaway || '').trim()
+    quotes,
+    keyTakeaway
   }
 }
 
@@ -1103,24 +1180,66 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
     temperature: 0.7
   }
 
+  // 赛事知识：防止模型因不了解新赛制而出错
+  const worldCupContext = `【参考资料】2026年美加墨世界杯是首次扩军至48队的赛事（此前为32队）。赛制：
+- 12个小组×4队，小组前两名+8个成绩最好的小组第三出线
+- 第一轮淘汰赛为1/16决赛（32强→16强），并非1/8决赛
+- 第二轮淘汰赛才是1/8决赛（16强→8强）
+- 随后依次为1/4决赛、半决赛、决赛
+- 如果视频标题或逐字稿中的比赛涉及2026年世界杯淘汰赛，需注意区分轮次名称：首轮淘汰赛应称为"1/16决赛"而非"1/8决赛"`
+
   const hasTranscript = content && content.trim().length > 10
+  const jsonSchema = `{
+  "summary": "深度摘要，覆盖主题背景、核心内容和价值洞察（500字以上）",
+  "keyPoints": [
+    "要点1：具体观点+重要性说明（50字以上）",
+    "要点2：具体观点+重要性说明（50字以上）"
+  ],
+  "topics": ["主题标签1", "主题标签2"],
+  "details": {
+    "mainArgument": "核心观点阐述（80字以上）",
+    "uniqueInsight": "最特别的洞察（80字以上）",
+    "actionAdvice": "可执行的建议（80字以上）"
+  },
+  "deepAnalysis": {
+    "structure": "内容结构分析（100字以上）",
+    "argumentQuality": "论证质量评估（100字以上）",
+    "uniqueValue": "差异分析（100字以上）",
+    "limitations": "局限性（50字以上）"
+  },
+  "quotes": ["提炼的金句或总结句（每条附解读）"],
+  "keyTakeaway": "一句话核心记忆点（30字以内）"
+}`
   const systemPrompt = hasTranscript
     ? `你是资深视频内容分析师，拥有视觉理解能力。你会同时收到视频的【完整逐字稿】和【视频画面截图】。
 你需要结合两者进行分析：文字提供对话、术语和数据，画面提供图表、表情、实物演示、PPT、场景氛围等视觉信息。
+
+${worldCupContext}
+
+⚠️ 重要原则：该视频是真实的转播/录制内容，不是虚构作品或游戏模拟。画面截图可能因压缩或录制质量显得不够清晰，但这不代表内容是虚构的。禁止在分析中加入"虚构"、"模拟"、"游戏生成"等标签。
 
 分析要求：
 1. 优先使用文字内容提取核心观点和论证逻辑
 2. 利用画面截图补充视觉信息：图表内容、人物表情、场景变化、实物展示、屏幕录制内容等
 3. 如果文字和画面信息有冲突或互补，在分析中明确指出
 4. 特别注意画面中的文字信息（PPT、白板、字幕等）
-5. ⛔ 事实核查：当文字内容提到具体比分、进球、红牌、点球等具体事实时，必须检查画面截图是否能佐证。如果画面无法佐证，请标注"（待核实）"
-6. 📊 比分和赛果必须交叉验证：文字描述的比分/结果需要与画面中的记分牌或庆祝画面比对，不一致时以画面为准并标注差异
+5. 事实核查：以文字内容为准，画面截图仅作辅助验证。不要因画面像素或渲染风格而否定内容的真实性
+6. 比分和赛果以文字描述为准
+7. 严格依据【参考资料】中的赛制规则识别比赛轮次，不要使用过时的32队赛制去推算
+8. ⚠️ 关键限制：只呈现标题、逐字稿、画面中明确出现的信息。如果具体细节（如比赛轮次、球员姓名、比分、时间点等）在素材中没有被提及，不要自行补充或脑补。改用概括性语言（如"比赛中"、"某位球员"）代替具体数字或名称。宁可模糊，不可编造。
 
-只返回纯 JSON，不要 Markdown，格式与 text-only 分析完全一致。`
+只返回纯 JSON，不要 Markdown，严格按以下格式（所有字段必填，不可留空）：
+${jsonSchema}`
     : `你是资深视频内容分析师，拥有视觉理解能力。你只能看到【视频画面截图】和标题。
 禁止编造具体细节，基于画面内容合理分析。
+⚠️ 该视频是真实转播/录制内容，不是虚构或游戏模拟。
 
-只返回纯 JSON，不要 Markdown，格式与标准分析完全一致。`
+${worldCupContext}
+
+⚠️ 关键限制：只呈现画面和标题中明确出现的信息，不脑补具体细节（如比分、球员、时间线）。不知道就用概括性语言。
+
+只返回纯 JSON，不要 Markdown，严格按以下格式：
+${jsonSchema}`
 
   const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n${hasTranscript ? `【完整逐字稿】\n${content.substring(0, 30000)}` : '【无逐字稿，仅依据画面截图分析】'}`
 
@@ -1131,7 +1250,8 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
 async function analyzeWithModel(title, content, videoUrl, modelType = 'recommended') {
   const config = getModelConfig(modelType)
   if (!config) throw new Error(`未知的模型类型: ${modelType}`)
-  const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n可用内容：\n${content?.substring(0, 24000) || '无正文内容，请基于标题和上下文推断，但必须标注“基于有限信息推断”。'}`
+  const worldCupContext = `【参考资料】2026年世界杯扩军至48队，首轮淘汰赛为1/16决赛（非1/8），第二轮为1/8决赛。`
+  const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n${worldCupContext}\n\n可用内容：\n${content?.substring(0, 24000) || '无正文内容，请基于标题和上下文推断，但必须标注"基于有限信息推断"。'}\n\n⚠️ 关键限制：只呈现可用内容中明确出现的信息，不脑补未提及的具体细节。不知道的用概括性语言。`
   const raw = await callAIModel(config, config.systemPrompt, userPrompt)
   return normalizeAnalysisResult(raw, { title, videoUrl })
 }

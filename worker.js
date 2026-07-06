@@ -83,10 +83,17 @@ videoQueue.process('parse-video', 1, async (job) => {
       try { fs.unlinkSync(localVideoPath) } catch {}
     }
 
+    // 如果标题仍为占位符，从摘要中提取前20字作为标题
+    let finalTitle = videoInfo.title
+    if (finalTitle === '解析中...' || finalTitle === '解析中…' || finalTitle === '未知视频' || !finalTitle) {
+      const extracted = (analysisResult.summary || '').replace(/^[""']+/, '').substring(0, 40).trim()
+      finalTitle = extracted || '视频分析'
+    }
+
     const resultData = {
       summary: analysisResult.summary,
       keyPoints: analysisResult.keyPoints,
-      title: videoInfo.title,
+      title: finalTitle,
       thumbnail: videoInfo.thumbnail,
       duration: formatDuration(videoInfo.duration),
       video_url: videoInfo.video_url || '',
@@ -94,11 +101,8 @@ videoQueue.process('parse-video', 1, async (job) => {
       details: analysisResult.details || {},
       deepAnalysis: analysisResult.deepAnalysis || null,
       quotes: analysisResult.quotes || [],
-      modelUsed: model,
-      contentMethod: contentMethod,
       language: language,
       dialogues: videoContent?.utterances || [],
-      videoType: videoContent?.videoType || 'unknown',
       webpage_url: videoInfo.webpage_url || '',
       source_url: job.data.url || ''
     }
@@ -109,7 +113,7 @@ videoQueue.process('parse-video', 1, async (job) => {
        SET status = 'completed', result_data = ?, video_title = ?, 
            video_duration = ?, processing_time = ?, updated_at = ?
        WHERE id = ?`,
-      [JSON.stringify(resultData), videoInfo.title, videoInfo.duration || 0, processingTime, getBeijingTime(), taskId]
+      [JSON.stringify(resultData), finalTitle, videoInfo.duration || 0, processingTime, getBeijingTime(), taskId]
     )
 
     console.log(`✅ 任务 ${taskId} 处理完成，耗时 ${processingTime} 秒`)
