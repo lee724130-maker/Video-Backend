@@ -55,12 +55,12 @@ videoQueue.process('parse-video', 1, async (job) => {
     }
     console.log(`🎬 抽帧结果: ${frames.length} 帧`)
 
-    // 4. 云端音频转写（当字幕和 Whisper 都未提供内容时）
+    // 4. 云端音频转写（当字幕和转录都未提供内容时）
     const contentText = videoContent && typeof videoContent === 'object' ? videoContent.text : (videoContent || '')
     if (!contentText && videoContent?.audioPath) {
-      console.log('🎙️ 使用云端 Omni 转写音频...')
+      console.log('🎙️ 使用 ASR 转写音频...')
       transcript = await transcribeAudioWithOmni(videoContent.audioPath)
-      contentMethod = transcript ? 'omni-transcribe' : 'none'
+      contentMethod = transcript ? 'asr-transcribe' : 'none'
       cleanupTempFile(videoContent.audioPath)
     }
 

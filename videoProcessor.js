@@ -20,6 +20,8 @@ const BAILIAN_MODEL_VL_LITE = process.env.BAILIAN_MODEL_VL_LITE || 'qwen2.5-vl-7
 const BAILIAN_MODEL_OMNI = process.env.BAILIAN_MODEL_OMNI || 'qwen3.5-omni-plus-2026-03-15'
 const BAILIAN_MODEL_OMNI_FLASH = process.env.BAILIAN_MODEL_OMNI_FLASH || 'qwen3-omni-flash'
 const BAILIAN_MODEL_VL_NEW = process.env.BAILIAN_MODEL_VL_NEW || 'qwen3-vl-30b-a3b-thinking'
+const BAILIAN_MODEL_ASR = process.env.BAILIAN_MODEL_ASR || 'fun-asr-flash-2026-06-15'
+const BAILIAN_DASHSCOPE_URL = process.env.BAILIAN_DASHSCOPE_URL || 'https://dashscope.aliyuncs.com/api/v1'
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com'
 const DOUBAO_API_KEY = process.env.DOUBAO_API_KEY
@@ -711,11 +713,11 @@ async function extractSceneFrames(videoPath, maxFrames = 5) {
   }
 }
 
-// 压缩音频到低码率（8kbps, 16kHz, 单声道）
+// 压缩音频为 WAV 16kHz 16bit 单声道（ASR 友好）
 async function compressAudio(audioPath) {
   const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
-  const compressedPath = path.join(tempDir, `${tempId}_compressed.mp3`)
-  const cmd = `ffmpeg -y -i "${audioPath}" -ac 1 -ar 16000 -ab 8k -f mp3 "${compressedPath}" -loglevel error`
+  const compressedPath = path.join(tempDir, `${tempId}_compressed.wav`)
+  const cmd = `ffmpeg -y -i "${audioPath}" -ac 1 -ar 16000 -sample_fmt s16 -f wav "${compressedPath}" -loglevel error`
   try {
     await execPromise(cmd, { timeout: 60000 })
     console.log(`🔊 音频压缩完成: ${compressedPath}`)
@@ -726,7 +728,7 @@ async function compressAudio(audioPath) {
   }
 }
 
-// 用 qwen3-omni-flash 转写音频（分批并行）
+// 用 fun-asr-flash 转写音频（分批并行）
 async function transcribeAudioWithOmni(audioPath) {
   const compressedPath = await compressAudio(audioPath)
   if (!compressedPath) return ''
@@ -742,13 +744,13 @@ async function transcribeAudioWithOmni(audioPath) {
     return ''
   }
 
-  // 按3分钟分段
+  // 按3分钟分段（fun-asr-flash 支持最长5分钟）
   const chunkDuration = 180
   const numChunks = Math.ceil(duration / chunkDuration)
   const chunkDir = path.join(tempDir, `chunks_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`)
   fs.mkdirSync(chunkDir, { recursive: true })
 
-  const splitCmd = `ffmpeg -y -i "${compressedPath}" -f segment -segment_time ${chunkDuration} -c copy "${path.join(chunkDir, 'chunk_%03d.mp3')}" -loglevel error`
+  const splitCmd = `ffmpeg -y -i "${compressedPath}" -f segment -segment_time ${chunkDuration} -c copy "${path.join(chunkDir, 'chunk_%03d.wav')}" -loglevel error`
   try {
     await execPromise(splitCmd, { timeout: 60000 })
   } catch (e) {
@@ -758,32 +760,39 @@ async function transcribeAudioWithOmni(audioPath) {
     return ''
   }
 
-  const files = fs.readdirSync(chunkDir).filter(f => f.endsWith('.mp3')).sort()
-  console.log(`🔊 音频转写: ${files.length} 段, 共 ${duration}s`)
+  const files = fs.readdirSync(chunkDir).filter(f => f.endsWith('.wav')).sort()
+  console.log(`🔊 ASR 转写: ${files.length} 段, 共 ${duration}s`)
 
   const results = await Promise.all(files.map(async (file, i) => {
     const filePath = path.join(chunkDir, file)
     const b64 = fs.readFileSync(filePath).toString('base64')
-    const messages = [{
-      role: 'user',
-      content: [
-        { type: 'input_audio', input_audio: { data: `data:audio/mp3;base64,${b64}`, format: 'mp3' } },
-        { type: 'text', text: '请逐字转录这段音频的中文内容，保留原话不要总结。' }
-      ]
-    }]
+    const body = JSON.stringify({
+      model: BAILIAN_MODEL_ASR,
+      input: {
+        messages: [{
+          role: 'user',
+          content: [{ type: 'input_audio', input_audio: { data: `data:audio/wav;base64,${b64}` } }]
+        }]
+      },
+      parameters: { format: 'wav', sample_rate: 16000 }
+    })
     try {
-      const resp = await fetch(`${BAILIAN_BASE_URL}/chat/completions`, {
+      const resp = await fetch(`${BAILIAN_DASHSCOPE_URL}/services/aigc/multimodal-generation/generation`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BAILIAN_API_KEY}` },
-        body: JSON.stringify({ model: BAILIAN_MODEL_OMNI_FLASH, messages, modalities: ['text'], max_tokens: 3000 })
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${BAILIAN_API_KEY}`,
+          'X-DashScope-SSE': 'disable'
+        },
+        body
       })
-      if (!resp.ok) { console.error(`❌ 音频段 ${i+1} 转录失败: ${resp.status}`); return '' }
+      if (!resp.ok) { console.error(`❌ ASR 段 ${i+1} 失败: ${resp.status}`); return '' }
       const data = await resp.json()
-      const text = data.choices[0].message.content
-      console.log(`✅ 音频段 ${i+1}/${files.length} 转录: ${text.length}字`)
+      const text = (data.output && data.output.text) || ''
+      console.log(`✅ ASR 段 ${i+1}/${files.length}: ${text.length}字`)
       return text
     } catch (e) {
-      console.error(`❌ 音频段 ${i+1} 异常:`, e.message)
+      console.error(`❌ ASR 段 ${i+1} 异常:`, e.message)
       return ''
     }
   }))
