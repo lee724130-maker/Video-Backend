@@ -102,6 +102,7 @@ videoQueue.process('parse-video', 1, async (job) => {
       deepAnalysis: analysisResult.deepAnalysis || null,
       quotes: analysisResult.quotes || [],
       language: language,
+      modelUsed: model,
       dialogues: videoContent?.utterances || [],
       webpage_url: videoInfo.webpage_url || '',
       source_url: job.data.url || ''
