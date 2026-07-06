@@ -12,6 +12,7 @@ const {
   extractFrames,
   extractSceneFrames,
   transcribeAudioWithOmni,
+  correctTranscription,
   formatDuration,
   cleanupTempFile
 } = require('./videoProcessor')
@@ -59,8 +60,14 @@ videoQueue.process('parse-video', 1, async (job) => {
     const contentText = videoContent && typeof videoContent === 'object' ? videoContent.text : (videoContent || '')
     if (!contentText && videoContent?.audioPath) {
       console.log('🎙️ 使用 ASR 转写音频...')
-      transcript = await transcribeAudioWithOmni(videoContent.audioPath)
-      contentMethod = transcript ? 'asr-transcribe' : 'none'
+      transcript = await transcribeAudioWithOmni(videoContent.audioPath, videoInfo.title)
+      if (transcript) {
+        console.log('✏️ 转写纠错中...')
+        transcript = await correctTranscription(transcript, videoInfo.title)
+        contentMethod = 'asr-transcribe'
+      } else {
+        contentMethod = 'none'
+      }
       cleanupTempFile(videoContent.audioPath)
     }
 

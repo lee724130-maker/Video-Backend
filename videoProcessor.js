@@ -729,7 +729,7 @@ async function compressAudio(audioPath) {
 }
 
 // 用 fun-asr-flash 转写音频（分批并行）
-async function transcribeAudioWithOmni(audioPath) {
+async function transcribeAudioWithOmni(audioPath, videoTitle = '') {
   const compressedPath = await compressAudio(audioPath)
   if (!compressedPath) return ''
 
@@ -760,19 +760,22 @@ async function transcribeAudioWithOmni(audioPath) {
     return ''
   }
 
+  const contextHint = videoTitle ? `视频标题：${videoTitle}，根据标题提供的领域信息辅助识别专有名词。` : ''
+
   const files = fs.readdirSync(chunkDir).filter(f => f.endsWith('.wav')).sort()
   console.log(`🔊 ASR 转写: ${files.length} 段, 共 ${duration}s`)
 
   const results = await Promise.all(files.map(async (file, i) => {
     const filePath = path.join(chunkDir, file)
     const b64 = fs.readFileSync(filePath).toString('base64')
+    const content = [{ type: 'input_audio', input_audio: { data: `data:audio/wav;base64,${b64}` } }]
+    if (contextHint) {
+      content.push({ type: 'text', text: contextHint })
+    }
     const body = JSON.stringify({
       model: BAILIAN_MODEL_ASR,
       input: {
-        messages: [{
-          role: 'user',
-          content: [{ type: 'input_audio', input_audio: { data: `data:audio/wav;base64,${b64}` } }]
-        }]
+        messages: [{ role: 'user', content }]
       },
       parameters: { format: 'wav', sample_rate: 16000 }
     })
@@ -1284,6 +1287,28 @@ function formatDuration(seconds) {
   return `${minutes}:${String(secs).padStart(2, '0')}`
 }
 
+// 转写后纠错：用文本模型根据视频标题修正错别字
+async function correctTranscription(text, videoTitle) {
+  if (!text || text.length < 10) return text
+  const systemPrompt = '你是一个语音转写纠错助手。根据视频标题提供的上下文，修正文本中的错别字和同音错误。只修正有把握的错误，不要改动无错误的部分。直接输出修正后的文本，不要多余的解释。'
+  const userPrompt = `视频标题：${videoTitle}\n\n转写文本：\n${text.substring(0, 24000)}`
+  try {
+    const resp = await fetch(`${BAILIAN_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BAILIAN_API_KEY}` },
+      body: JSON.stringify({ model: BAILIAN_MODEL_FLASH, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], max_tokens: 30000 })
+    })
+    if (!resp.ok) { console.warn(`⚠️ 转写纠错失败: ${resp.status}`); return text }
+    const data = await resp.json()
+    const corrected = data.choices[0].message.content.trim()
+    if (corrected && corrected.length > text.length * 0.5) return corrected
+    return text
+  } catch (e) {
+    console.warn('⚠️ 转写纠错异常:', e.message)
+    return text
+  }
+}
+
 module.exports = {
   getBeijingTime,
   getVideoInfo,
@@ -1298,6 +1323,7 @@ module.exports = {
   extractFrames,
   extractSceneFrames,
   transcribeAudioWithOmni,
+  correctTranscription,
   formatDuration,
   cleanupTempFile,
   processLocalVideo
