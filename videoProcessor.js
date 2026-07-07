@@ -309,7 +309,6 @@ async function getXiaohongshuVideoInfo(videoUrl) {
 
   // 首次尝试：匿名解析（不需要登录）
   try {
-  try {
     const result = await resolveXiaohongshuWithPlaywright(videoUrl)
     if (result && result.video_url) {
       console.log(`✅ 小红书解析成功: ${result.title?.substring(0, 50)}`)
@@ -753,7 +752,6 @@ async function transcribeAudioWithOmni(audioPath, videoTitle = '') {
 
   // 第二步：获取音频时长（秒），用于分段
   let duration = 0
-  let duration = 0
   try {
     const { stdout } = await execPromise(`ffprobe -i "${compressedPath}" -show_entries format=duration -v quiet -of csv="p=0"`, { timeout: 10000 })
     duration = Math.ceil(parseFloat(stdout.trim()))
@@ -913,22 +911,21 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
 
     try {
       const parsed = JSON.parse(content)
-      // 检测并展平嵌套 JSON：如果 summary 字段的值本身是一个 JSON 字符串
-      // （omni 模型有时把整个分析对象打包成字符串塞进 summary 字段）
-      if (parsed && typeof parsed === 'object' && typeof parsed.summary === 'string') {
-        const trimmedSummary = parsed.summary.trim()
-        if (trimmedSummary.startsWith('{')) {
-          try {
-            const inner = JSON.parse(trimmedSummary)
-            if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
-              // 用内层对象合并覆盖外层，保留外层中有而内层没有的字段
-              for (const key of Object.keys(inner)) {
-                if (inner[key] !== null && inner[key] !== undefined && !(Array.isArray(inner[key]) && inner[key].length === 0)) {
-                  parsed[key] = inner[key]
-                }
-              }
+      // 检测并展平嵌套 JSON：模型有时把整个分析对象打包成字符串塞进 summary 字段
+      // 支持 summary 为 JSON 字符串或直接为对象两种情况
+      if (parsed && typeof parsed === 'object') {
+        let innerSummary = null
+        if (typeof parsed.summary === 'string' && parsed.summary.trim().startsWith('{')) {
+          try { innerSummary = JSON.parse(parsed.summary.trim()) } catch {}
+        } else if (typeof parsed.summary === 'object' && !Array.isArray(parsed.summary)) {
+          innerSummary = parsed.summary
+        }
+        if (innerSummary && typeof innerSummary === 'object' && !Array.isArray(innerSummary)) {
+          for (const key of Object.keys(innerSummary)) {
+            if (innerSummary[key] !== null && innerSummary[key] !== undefined && !(Array.isArray(innerSummary[key]) && innerSummary[key].length === 0)) {
+              parsed[key] = innerSummary[key]
             }
-          } catch {}
+          }
         }
       }
       return parsed
@@ -938,17 +935,20 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
         try {
           const parsed = JSON.parse(jsonMatch[0])
           // 同样展平嵌套
-          if (parsed && typeof parsed === 'object' && typeof parsed.summary === 'string' && parsed.summary.trim().startsWith('{')) {
-            try {
-              const inner = JSON.parse(parsed.summary.trim())
-              if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
-                for (const key of Object.keys(inner)) {
-                  if (inner[key] !== null && inner[key] !== undefined && !(Array.isArray(inner[key]) && inner[key].length === 0)) {
-                    parsed[key] = inner[key]
-                  }
+          if (parsed && typeof parsed === 'object') {
+            let innerSummary = null
+            if (typeof parsed.summary === 'string' && parsed.summary.trim().startsWith('{')) {
+              try { innerSummary = JSON.parse(parsed.summary.trim()) } catch {}
+            } else if (typeof parsed.summary === 'object' && !Array.isArray(parsed.summary)) {
+              innerSummary = parsed.summary
+            }
+            if (innerSummary && typeof innerSummary === 'object' && !Array.isArray(innerSummary)) {
+              for (const key of Object.keys(innerSummary)) {
+                if (innerSummary[key] !== null && innerSummary[key] !== undefined && !(Array.isArray(innerSummary[key]) && innerSummary[key].length === 0)) {
+                  parsed[key] = innerSummary[key]
                 }
               }
-            } catch {}
+            }
           }
           return parsed
         } catch (e2) {
@@ -966,13 +966,13 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
 
 // 统一数组格式化：将字符串、对象数组或空值统一转为字符串数组（去重 + 序号归一化）
 function normalizeStringList(value) {
-  // 每项处理：清理噪音标点 + 序号归一化 1) 1、→ 1.
+  // 每项处理：清理噪音标点 + 序号归一化 1) 1、→ 1.，支持行内多处序号
   const cleanItem = (s) => {
     s = String(s)
     // 清理数字序号前的噪音标点（如 "，1)" → "1)"）
     s = s.replace(/^[^\w\d]*(\d+[\)、）])/, '$1')
-    // 将 N) N、 N）统一为 N. 格式
-    s = s.replace(/^(\d+)[\)、）]/, '$1. ')
+    // 将 N) N、 N）统一为 N. 格式（全局替换，处理一行内多个序号如 "1)...2)...3)..."）
+    s = s.replace(/(\d+)[\)、）]/g, '$1. ')
     // 移除列表标记符号（- * • 等），保留纯文本
     s = s.replace(/^[-*•]\s*/, '')
     return s.trim()
@@ -989,9 +989,9 @@ function normalizeStringList(value) {
   }
 
   if (typeof value === 'string') {
-    // 优先按换行拆分，再逐行归一化
+    // 按换行或数字序号拆分为独立条目，再逐条归一化
     return value
-      .split('\n')
+      .split(/\n+|(?:\d+\s*[\)、）])/)
       .map(item => cleanItem(item))
       .filter(Boolean)
   }
@@ -1007,7 +1007,10 @@ function pointsFromSummary(summary, title) {
     .map(item => item.trim())
     .filter(item => item.length >= 12)
 
-  const points = sentences.slice(0, 5)
+  const points = sentences.slice(0, 5).map(s => {
+    // 同样归一化序号格式 1) → 1.
+    return s.replace(/(\d+)[\)、）]/g, '$1. ').trim()
+  })
   while (points.length < 5) {
     points.push(points.length === 0
       ? `基于有限信息推断，视频《${title || '该视频'}》围绕标题呈现的核心主题展开，需要结合原视频进一步核对细节。`
@@ -1043,6 +1046,7 @@ function normalizeAnalysisResult(raw, context = {}) {
   const title = context.title || result.title || '视频'
 
   // 检测 result.summary 是否包含嵌套 JSON（模型有时把整个分析塞进 summary 字段）
+  // 支持 JSON 字符串和直接对象两种形式
   let inner = null
   const rawSummaryField = result.summary || result.overview || result.abstract || ''
   if (typeof rawSummaryField === 'string') {
@@ -1052,6 +1056,8 @@ function normalizeAnalysisResult(raw, context = {}) {
         inner = parsed  // 完整的内层分析对象
       }
     } catch {}
+  } else if (rawSummaryField && typeof rawSummaryField === 'object' && !Array.isArray(rawSummaryField)) {
+    inner = rawSummaryField  // 已经是对象，直接使用
   }
 
   // 从内层或外层提取 summary
@@ -1065,6 +1071,8 @@ function normalizeAnalysisResult(raw, context = {}) {
   const hasKeyPointsGarbage = keyPoints.length > 0 && keyPoints.some(k => k.trim().startsWith('{'))
   if (keyPoints.length === 0 || hasKeyPointsGarbage) {
     if (useInner) keyPoints = normalizeStringList(inner.keyPoints)
+    // 即使 useInner 不可用，也过滤掉明显是 JSON 碎片的条目（以 { 开头）
+    if (hasKeyPointsGarbage) keyPoints = keyPoints.filter(k => !k.trim().startsWith('{'))
   }
 
   const details = useInner && inner.details
