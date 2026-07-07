@@ -1,3 +1,4 @@
+// MySQL 数据库连接池配置（读取 .env 中的 DB 环境变量）
 const mysql = require('mysql2/promise')
 const path = require('path')
 require('dotenv').config({ path: path.join(__dirname, '.env') })

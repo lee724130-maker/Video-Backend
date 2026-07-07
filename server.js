@@ -1,3 +1,4 @@
+// Express API 服务器：用户认证、视频解析、VIP/支付、管理后台、数据统计
 const express = require('express')
 const cors = require('cors')
 const helmet = require('helmet')
@@ -38,7 +39,7 @@ const PORT = process.env.PORT || 3001
 const JWT_SECRET = process.env.JWT_SECRET || 'Extract-secret-key-2024'
 const JWT_EXPIRES_IN = '7d'
 
-// ========== 多模型 API 配置 ==========
+// ========== 多模型 API 配置（百炼/DeepSeek/豆包）==========
 const BAILIAN_API_KEY = process.env.BAILIAN_API_KEY
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DOUBAO_API_KEY = process.env.DOUBAO_API_KEY
@@ -304,7 +305,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
 })
 
-// ========== 管理员任务管理 API ==========
+// ========== 管理员任务管理 API（列表/删除/清空）==========
 app.get('/api/admin/tasks', authenticateAdmin, async (req, res) => {
   const page = parseInt(req.query.page) || 1
   const size = parseInt(req.query.size) || 10
@@ -366,7 +367,7 @@ app.delete('/api/admin/tasks/all', authenticateAdmin, async (req, res) => {
   }
 })
 
-// ========== 队列统计 API ==========
+// ========== 管理员队列统计 API（等待/活跃/完成/失败数）==========
 app.get('/api/admin/queue/stats', authenticateAdmin, async (req, res) => {
   try {
     const [waiting, active, completed, failed] = await Promise.all([
@@ -381,7 +382,7 @@ app.get('/api/admin/queue/stats', authenticateAdmin, async (req, res) => {
   }
 })
 
-// ========== 普通用户 API ==========
+// ========== 用户端 API：验证码/注册/登录/找回密码 ==========
 app.post('/api/app/send-code', async (req, res) => {
   const { email } = req.body
   if (!email) return res.status(400).json({ code: 400, message: '请提供邮箱地址' })
@@ -573,7 +574,7 @@ app.post('/api/app/login', async (req, res) => {
   }
 })
 
-// ========== 获取当前用户信息 ==========
+// ========== 用户信息 API（个人资料/头像/用户名/密码/邮箱修改）==========
 app.get('/api/app/me', authenticateAppUser, async (req, res) => {
   try {
     const [users] = await pool.query(
@@ -662,7 +663,7 @@ app.put('/api/app/email', authenticateAppUser, async (req, res) => {
   }
 })
 
-// ========== VIP 会员管理 API ==========
+// ========== VIP 会员 API（信息查询/升级套餐/套餐列表）==========
 app.get('/api/app/vip/info', authenticateAppUser, async (req, res) => {
   try {
     const [users] = await pool.query('SELECT vip_level, vip_expired_at, credits_balance FROM app_users WHERE id = ?', [req.userId])
@@ -702,7 +703,7 @@ app.post('/api/app/vip/upgrade', authenticateAppUser, async (req, res) => {
   }
 })
 
-// ========== 支付接口 ==========
+// ========== 支付接口（创建订单/支付回调/订单查询/客服留言/付款通知）==========
 
 // 获取 VIP 套餐列表
 app.get('/api/app/vip/plans', authenticateAppUser, async (req, res) => {
@@ -896,7 +897,7 @@ app.post('/api/app/checkin', authenticateAppUser, async (req, res) => {
   }
 })
 
-// ========== 通知系统 API ==========
+// ========== 通知系统 API（列表/未读数/标记已读/全部已读/清空）==========
 app.get('/api/app/notifications', authenticateAppUser, async (req, res) => {
   try {
     const [rows] = await pool.query(
@@ -973,7 +974,7 @@ app.post('/api/admin/users/:id/vip-manual', authenticateAdmin, async (req, res) 
   }
 })
 
-// 管理员：获取 VIP 统计数据
+// 管理员获取 VIP 统计数据（各级别数量/有效会员数/总用户数）
 app.get('/api/admin/vip/stats', authenticateAdmin, async (req, res) => {
   try {
     const [vipStats] = await pool.query(`
@@ -1005,7 +1006,7 @@ app.get('/api/admin/vip/stats', authenticateAdmin, async (req, res) => {
   }
 })
 
-// ========== 核心：视频解析 API（队列模式）==========
+// ========== 核心 API：视频解析（创建任务/查询状态/任务列表/删除/思维导图）==========
 app.post('/api/app/parse', authenticateAppUser, async (req, res) => {
   const { url, model = 'recommended', language = 'auto' } = req.body
   
@@ -1416,7 +1417,7 @@ app.post('/api/app/mindmap/:taskId', authenticateAppUser, async (req, res) => {
   }
 })
 
-// ========== 视频代理下载（解决 CDN 403 问题） ==========
+// ========== 视频代理下载 API（解决 CDN 防盗链 403，支持 B 站 yt-dlp 下载 + 直链流式代理）==========
 app.get('/api/app/proxy-video', async (req, res) => {
   const videoUrl = req.query.url
   const token = req.query.token || req.headers.authorization?.replace('Bearer ', '')
@@ -1576,7 +1577,7 @@ app.get('/api/app/proxy-video', async (req, res) => {
   }
 })
 
-// ========== 管理员 API ==========
+// ========== 管理员 API（登录/仪表盘/用户管理/订单管理/系统设置）==========
 app.post('/api/admin/auth/login', async (req, res) => {
   const { username, password } = req.body
   if (!username || !password) return res.status(400).json({ code: 400, message: '请填写用户名和密码' })
@@ -1659,7 +1660,7 @@ app.get('/api/admin/dashboard/recent-tasks', authenticateAdmin, async (req, res)
   }
 })
 
-// ========== 页面浏览量统计 ==========
+// ========== 页面浏览量统计（用户端上报 + 管理员看板）==========
 app.post('/api/app/track-visit', async (req, res) => {
   try {
     const { visitor_id, page_url, referrer } = req.body
@@ -2000,7 +2001,7 @@ app.post('/api/admin/users/:id/unblock', authenticateAdmin, async (req, res) => 
   }
 })
 
-// ========== 订单管理 ==========
+// ========== 订单管理（管理员查询/确认付款/退款取消）==========
 app.get('/api/admin/orders', authenticateAdmin, async (req, res) => {
   const { page = 1, size = 20, status, provider } = req.query
   const offset = (parseInt(page) - 1) * parseInt(size)
@@ -2153,7 +2154,7 @@ app.put('/api/admin/orders/:orderNo/status', authenticateAdmin, async (req, res)
   }
 })
 
-// ========== 系统设置 ==========
+// ========== 系统设置（管理员读写 system_configs 表）==========
 app.get('/api/admin/settings', authenticateAdmin, async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT config_key, config_value FROM system_configs')
@@ -2338,7 +2339,7 @@ async function ensureAdminUser() {
   }
 }
 
-// ========== 微信小程序登录（优化版：支持头像昵称 + friendly_id）==========
+// ========== 微信小程序登录（jscode2session + 邮箱/手机号关联 + 自动注册）==========
 app.post('/api/app/wx-login', async (req, res) => {
   const { code, nickName, avatarUrl, email, phone } = req.body;
   
@@ -2470,7 +2471,7 @@ app.post('/api/app/wx-login', async (req, res) => {
   }
 });
 
-// ========== 小程序绑定邮箱 ==========
+// ========== 小程序绑定邮箱（发送验证码/绑定/解绑）==========
 
 // 1. 发送邮箱验证码（绑定邮箱用）
 app.post('/api/app/send-bind-email-code', authenticateAppUser, async (req, res) => {
@@ -2583,7 +2584,7 @@ app.post('/api/app/unbind-email', authenticateAppUser, async (req, res) => {
   }
 });
 
-// ========== 短信服务（阿里云） ==========
+// ========== 阿里云短信服务（发送手机验证码，含 HMAC-SHA1 签名）==========
 const SMS_ACCESS_KEY = process.env.SMS_ACCESS_KEY || ''
 const SMS_ACCESS_SECRET = process.env.SMS_ACCESS_SECRET || ''
 const SMS_SIGN_NAME = process.env.SMS_SIGN_NAME || 'Extract'        // 短信签名
@@ -2644,7 +2645,7 @@ const sendPhoneCodeSms = async (phone, code) => {
   }
 }
 
-// ========== 小程序绑定手机号 ==========
+// ========== 小程序绑定手机号（发送验证码/绑定/解绑）==========
 
 // 1. 发送手机验证码
 app.post('/api/app/send-phone-code', authenticateAppUser, async (req, res) => {
@@ -2762,7 +2763,7 @@ app.post('/api/app/unbind-phone', authenticateAppUser, async (req, res) => {
   }
 });
 
-// ========== 跨平台 VIP 同步 ==========
+// ========== 跨平台 VIP 同步（小程序 ⇄ 网页端，通过邮箱/手机号关联同步）==========
 const getVipTimestamp = (vipExpiredAt) => {
   if (!vipExpiredAt) return Number.MAX_SAFE_INTEGER;
   const time = new Date(vipExpiredAt).getTime();
@@ -3124,7 +3125,7 @@ app.post('/api/app/sync-vip-to-phone', authenticateAppUser, async (req, res) => 
   }
 });
 
-// ========== 数据库初始化 ==========
+// ========== 数据库初始化（建表、扩字段、补齐索引、创建管理员）==========
 async function initDatabase() {
   try {
     await pool.query(`
@@ -3294,7 +3295,7 @@ async function initDatabase() {
   }
 }
 
-// ========== 启动服务器 ==========
+// ========== 启动服务器（初始化数据库/邮箱/模型/优雅关闭）==========
 async function startServer() {
   await initDatabase()
   initEmailTransporter()

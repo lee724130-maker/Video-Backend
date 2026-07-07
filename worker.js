@@ -1,6 +1,8 @@
+// 队列消费 Worker：从 Bull 队列中取出视频分析任务并依次处理
 const { videoQueue } = require('./queue')
 const pool = require('./db')
 const fs = require('fs')
+// 引入核心视频处理模块的所有分析函数
 const {
   getBeijingTime,
   getVideoInfo,
@@ -17,24 +19,27 @@ const {
   cleanupTempFile
 } = require('./videoProcessor')
 
+// 注册队列消费者：每次并发处理1个任务（parse-video 类型）
 videoQueue.process('parse-video', 1, async (job) => {
+  // 从任务数据中解析参数
   const { taskId, url, model, language, enableSpeakerDiarization, videoInfo } = job.data
   const taskStartTime = Date.now()
 
   console.log(`🔧 Worker 开始处理任务 ${taskId}: ${url}`)
 
   try {
+    // videoContent: 字幕文本或 smartTranscribe 结果对象
     let videoContent = null
     let contentMethod = 'none'
     let transcript = ''
 
-    // 1. 字幕提取
+    // ========== 阶段1: 尝试提取字幕 ==========
     try {
       videoContent = await extractSubtitles(url)
       if (videoContent) contentMethod = 'subtitle'
     } catch (e) {}
 
-    // 2. 音频提取（跳过本地 Whisper，提取路径供云端转写）
+    // ========== 阶段2: 字幕失败则提取音频（供云端 ASR 转写）==========
     if (!videoContent) {
       const transcribeResult = await smartTranscribe(url, videoInfo.title, videoInfo.description, videoInfo.duration, enableSpeakerDiarization, videoInfo.video_url)
       videoContent = transcribeResult
@@ -43,7 +48,7 @@ videoQueue.process('parse-video', 1, async (job) => {
 
     const localVideoPath = videoContent?.videoPath || ''
 
-    // 3. 场景检测抽帧（有本地视频则从本地，否则从直链）
+    // ========== 阶段3: 视频画面抽帧（本地优先，直链降级）==========
     let frames = []
     if (localVideoPath) {
       console.log(`🎬 场景检测抽帧: ${localVideoPath}`)
@@ -56,7 +61,7 @@ videoQueue.process('parse-video', 1, async (job) => {
     }
     console.log(`🎬 抽帧结果: ${frames.length} 帧`)
 
-    // 4. 云端音频转写（当字幕和转录都未提供内容时）
+    // ========== 阶段4: 云端 ASR 转写（字幕和直接转录都失败时降级使用）==========
     const contentText = videoContent && typeof videoContent === 'object' ? videoContent.text : (videoContent || '')
     if (!contentText && videoContent?.audioPath) {
       console.log('🎙️ 使用 ASR 转写音频...')
@@ -71,9 +76,10 @@ videoQueue.process('parse-video', 1, async (job) => {
       cleanupTempFile(videoContent.audioPath)
     }
 
+    // 最终传递给分析引擎的文本内容（优先使用 ASR 转写结果）
     const finalContent = transcript || contentText
 
-    // 5. 分析
+    // ========== 阶段5: AI 内容分析（全模态→纯文字降级）==========
     let analysisResult
     if (frames.length > 0) {
       try {
@@ -86,11 +92,12 @@ videoQueue.process('parse-video', 1, async (job) => {
       analysisResult = await analyzeWithModel(videoInfo.title, finalContent, url, model)
     }
 
+    // 清理本地下载的视频文件（如有）
     if (localVideoPath) {
       try { fs.unlinkSync(localVideoPath) } catch {}
     }
 
-    // 如果标题仍为占位符，从摘要中提取前20字作为标题
+    // 如果标题仍为占位符（解析中...），从摘要中提取前20字作为标题
     let finalTitle = videoInfo.title
     if (finalTitle === '解析中...' || finalTitle === '解析中…' || finalTitle === '未知视频' || !finalTitle) {
       const extracted = (analysisResult.summary || '').replace(/^[""']+/, '').substring(0, 40).trim()
@@ -115,6 +122,7 @@ videoQueue.process('parse-video', 1, async (job) => {
       source_url: job.data.url || ''
     }
 
+    // ========== 阶段6: 更新数据库任务状态为完成 ==========
     const processingTime = Math.floor((Date.now() - taskStartTime) / 1000)
     await pool.query(
       `UPDATE video_tasks 
@@ -128,6 +136,7 @@ videoQueue.process('parse-video', 1, async (job) => {
     return { taskId, status: 'completed', result: resultData }
 
   } catch (error) {
+    // 任务失败：更新数据库状态为 failed，保存错误信息
     console.error(`❌ 任务 ${taskId} 处理失败:`, error)
     await pool.query(
       `UPDATE video_tasks SET status = 'failed', error_message = ?, updated_at = ? WHERE id = ?`,

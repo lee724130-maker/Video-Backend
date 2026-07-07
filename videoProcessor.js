@@ -1,16 +1,19 @@
-﻿const fs = require('fs')
+﻿// 文件系统与路径操作
+const fs = require('fs')
 const path = require('path')
+// 子进程执行（exec用于简单命令，spawn用于流式处理）
 const { exec, spawn } = require('child_process')
 const util = require('util')
 
+// 将 exec 转为 Promise 版本，便于 async/await 调用
 const execPromise = util.promisify(exec)
 
-// 配置
+// 配置：视频下载工具路径、B站 Cookie、临时文件目录
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp'
 const BILIBILI_COOKIES_FILE = path.join(__dirname, 'bilibili_cookies.txt')
 const tempDir = path.join(__dirname, 'temp')
 
-// API Keys
+// ========== AI 模型 API 配置 ==========
 const BAILIAN_API_KEY = process.env.BAILIAN_API_KEY
 const BAILIAN_BASE_URL = process.env.BAILIAN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 const BAILIAN_MODEL_PRO = process.env.BAILIAN_MODEL_PRO || 'tongyi-xiaomi-analysis-pro'
@@ -28,7 +31,7 @@ const DOUBAO_API_KEY = process.env.DOUBAO_API_KEY
 const DOUBAO_BASE_URL = process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3'
 const DOUBAO_MODEL = process.env.DOUBAO_MODEL || 'doubao-lite-32k'
 
-// 获取北京时间
+// 获取北京时间（用于日志时间戳）
 const getBeijingTime = () => {
   const now = new Date()
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`
@@ -43,7 +46,7 @@ function cleanupTempFile(filePath) {
   }
 }
 
-// 提取 YouTube ID
+// 从 YouTube URL 中提取视频 ID（支持多种 URL 格式）
 function extractYouTubeId(url) {
   const patterns = [
     /(?:youtube\.com\/watch\?v=)([^&]+)/,
@@ -71,7 +74,7 @@ function isXiaohongshuUrl(url) {
   return urlStr.includes('xiaohongshu.com') || urlStr.includes('xhslink.com');
 }
 
-// 从抖音短链接中提取 video_id
+// 从抖音各种 URL 格式中提取 video_id（短链接、完整链接、分享页）
 async function resolveDouyinVideoId(videoUrl) {
   const urlStr = String(videoUrl).toLowerCase()
 
@@ -85,8 +88,8 @@ async function resolveDouyinVideoId(videoUrl) {
   const iesCodeMatch = urlStr.match(/iesdouyin\.com\/share\/video\/([a-zA-Z0-9]+)/)
   if (iesCodeMatch) return iesCodeMatch[1]
 
-  // 短链接 v.douyin.com/xxx → 多次尝试获取 video ID
-  // 方法1: 用 redirect follow 获取最终 URL
+  // 短链接 v.douyin.com/xxx → 通过 HTTP 重定向解析真实 video ID
+  // 方法1: 用 redirect follow 获取最终 URL，再从中提取 video ID
   try {
     const response = await fetch(videoUrl, {
       method: 'GET',
@@ -100,7 +103,7 @@ async function resolveDouyinVideoId(videoUrl) {
     if (idMatch) return idMatch[1]
   } catch {}
 
-  // 方法2: 从分享短链接 HTML 中提取 canonical URL 或 video ID
+  // 方法2: 从分享短链接 HTML 页面中提取 canonical URL 或 video ID（不跟随重定向，手动解析）
   try {
     const resp = await fetch(videoUrl, {
       headers: {
@@ -121,14 +124,14 @@ async function resolveDouyinVideoId(videoUrl) {
     if (ogMatch) return ogMatch[1]
   } catch {}
 
-  // 方法3: 提取短码，让 getDouyinVideoInfo 用 iesdouyin + Playwright 兜底
+  // 方法3: 提取短码作为 video ID，后续由 iesdouyin + Playwright 兜底解析
   const shortCode = urlStr.match(/v\.douyin\.com\/([a-zA-Z0-9]+)/)
   if (shortCode) return shortCode[1]
 
   throw new Error('无法从抖音链接中提取视频ID')
 }
 
-// 从 HTML 中提取 window._ROUTER_DATA JSON
+// 从抖音/iesdouyin 页面 HTML 中提取 window._ROUTER_DATA JSON（手动解析花括号匹配）
 function extractRouterData(html) {
   const marker = 'window._ROUTER_DATA = '
   const startIdx = html.indexOf(marker)
@@ -158,12 +161,14 @@ function extractRouterData(html) {
   return JSON.parse(jsonStr)
 }
 
-// ========== 抖音解析器（基于 iesdouyin.com 分享页）==========
+// ========== 抖音视频解析主函数（三层降级：iesdouyin → Douyin API → Playwright）==========
 async function getDouyinVideoInfo(videoUrl) {
   console.log(`📱 解析抖音视频: ${videoUrl}`)
 
+  // 第一步：从 URL 中提取 video ID
   const videoId = await resolveDouyinVideoId(videoUrl)
   let html = ''
+  // 第二层：尝试通过 iesdouyin 分享页面获取视频信息
   try {
     const shareUrl = `https://www.iesdouyin.com/share/video/${videoId}/`
     const response = await fetch(shareUrl, {
@@ -179,13 +184,16 @@ async function getDouyinVideoInfo(videoUrl) {
     console.warn(`⚠️ iesdouyin 请求失败: ${iesErr.message}`)
   }
 
+  // 从 HTML 中解析 _ROUTER_DATA JSON，提取视频元信息
   const data = extractRouterData(html)
 
   if (data) {
     const loaderData = data.loaderData
+    // 查找非 layout 的 video 数据键名（动态键名）
     const videoKey = Object.keys(loaderData).find(k => k !== 'video_layout' && loaderData[k]?.videoInfoRes)
     const item = videoKey ? loaderData[videoKey].videoInfoRes.item_list?.[0] : undefined
     if (item) {
+      // 提取无水印播放地址（将 /playwm/ 替换为 /play/）
       const playUrl = item.video?.play_addr?.url_list?.[0] || ''
       const noWatermarkUrl = playUrl.replace('/playwm/', '/play/').replace('playwm', 'play')
       const thumbnail = item.video?.cover?.url_list?.[0] || item.video?.dynamic_cover?.url_list?.[0] || ''
@@ -203,7 +211,7 @@ async function getDouyinVideoInfo(videoUrl) {
     }
   }
 
-  // Fallback: use Douyin Web API directly
+  // Fallback: 直接调用 Douyin Web API 获取视频详情
   console.log('🔄 iesdouyin 解析失败，尝试 Douyin API 直连')
   try {
     const apiUrl = `https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=${videoId}`
@@ -236,7 +244,7 @@ async function getDouyinVideoInfo(videoUrl) {
     console.warn(`⚠️ Douyin API 请求失败: ${apiErr.message}`)
   }
 
-  // Fallback: Playwright 浏览器解析
+  // 第三层降级：使用 Playwright 无头浏览器解析抖音页面（对抗强反爬）
   console.log('🔄 尝试 Playwright 解析抖音')
   try {
     const { resolveDouyinWithPlaywright } = require('./douyin_playwright')
@@ -260,12 +268,12 @@ async function getDouyinVideoInfo(videoUrl) {
   throw new Error('无法从抖音页面提取数据，页面结构可能已变更')
 }
 
-// 构建 yt-dlp 命令
+// 构建 yt-dlp 命令，根据平台添加 UA、代理、Cookie 等额外参数
 function buildYtdlpCommand(baseCmd, videoUrl) {
   let cmd = baseCmd
   cmd += ` --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"`
   
-  // YouTube 配置
+  // YouTube 特殊配置：代理或 Android 客户端模式绕过限制
   if (videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')) {
     const proxy = process.env.YOUTUBE_PROXY || ''
     if (proxy) {
@@ -277,7 +285,7 @@ function buildYtdlpCommand(baseCmd, videoUrl) {
     }
   }
 
-  // B站专用请求头
+  // B站专用请求头（Referer/Origin 防盗链 + Cookie 登录态）
   if (videoUrl.includes('bilibili.com')) {
     cmd += ` --add-header "Referer: https://www.bilibili.com/"`
     cmd += ` --add-header "Origin: https://www.bilibili.com"`
@@ -292,13 +300,15 @@ function buildYtdlpCommand(baseCmd, videoUrl) {
   return cmd
 }
 
-// ========== 小红书解析器（基于 Playwright）==========
+// ========== 小红书视频解析器（Playwright 无头浏览器 + Cookie 降级）==========
 const XHS_COOKIE_FILE = path.join(__dirname, 'xiaohongshu_cookies.json')
 
 async function getXiaohongshuVideoInfo(videoUrl) {
+  // 动态引入 Playwright 模块（避免启动时加载）
   const { resolveXiaohongshuWithPlaywright } = require('./xiaohongshu_playwright')
 
-  // 首次：匿名解析
+  // 首次尝试：匿名解析（不需要登录）
+  try {
   try {
     const result = await resolveXiaohongshuWithPlaywright(videoUrl)
     if (result && result.video_url) {
@@ -326,21 +336,21 @@ async function getXiaohongshuVideoInfo(videoUrl) {
   }
 }
 
-// 获取视频信息（主入口：抖音走Playwright，小红书走Playwright，其他走 yt-dlp）
+// 获取视频信息（主入口：抖音/小红书走专用解析器，其余平台走 yt-dlp）
 async function getVideoInfo(videoUrl) {
   console.log(`📥 获取视频信息: ${videoUrl}`)
   
-  // 抖音使用专用解析器
+  // 抖音使用专用解析器（三层降级：iesdouyin → API → Playwright）
   if (isDouyinUrl(videoUrl)) {
     return await getDouyinVideoInfo(videoUrl)
   }
   
-  // 小红书使用 Playwright 解析器
+  // 小红书使用 Playwright 解析器（含 Cookie 登录降级）
   if (isXiaohongshuUrl(videoUrl)) {
     return await getXiaohongshuVideoInfo(videoUrl)
   }
   
-  // 其他平台：使用 yt-dlp
+  // 其他平台（YouTube、B站等）：使用 yt-dlp 工具解析
   console.log('🔍 使用 yt-dlp 解析')
   const baseCmd = `"${YTDLP_PATH}" --dump-json --skip-download`
   const cmd = buildYtdlpCommand(baseCmd, videoUrl)
@@ -349,11 +359,13 @@ async function getVideoInfo(videoUrl) {
     const { stdout } = await execPromise(cmd, { timeout: 60000 })
     const info = JSON.parse(stdout)
     let thumbnail = info.thumbnail || ''
+    // YouTube 特殊处理：使用官方缩略图 CDN（更稳定）
     if (videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')) {
       const videoId = extractYouTubeId(videoUrl)
       if (videoId) thumbnail = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`
     }
     let directUrl = info.url
+    // 如果 yt-dlp 返回多格式列表，提取视频流 URL
     if (!directUrl && info.requested_formats) {
       const videoFmt = info.requested_formats.find(f => f.video_ext && f.video_ext !== 'none')
       if (videoFmt) directUrl = videoFmt.url
@@ -373,7 +385,7 @@ async function getVideoInfo(videoUrl) {
   }
 }
 
-// 提取字幕
+// 使用 yt-dlp 提取视频字幕（自动/简体/繁体/英文，VTT 格式）
 async function extractSubtitles(videoUrl) {
   console.log(`📝 提取字幕: ${videoUrl}`)
   
@@ -453,7 +465,7 @@ async function extractSubtitles(videoUrl) {
   }
 }
 
-// 下载视频文件到本地
+// 通过 curl 下载视频文件到本地（作为 yt-dlp 的降级方案）
 async function downloadVideo(videoUrl, outputPath) {
   console.log(`📥 下载视频: ${videoUrl?.substring(0, 50)}...`)
   const cmd = `curl -L -s -o "${outputPath}" "${videoUrl}" --connect-timeout 30 --max-time 300`
@@ -461,8 +473,8 @@ async function downloadVideo(videoUrl, outputPath) {
   console.log(`✅ 视频下载完成: ${outputPath}`)
 }
 
-// 下载音频（yt-dlp 优先，失败则下载完整视频后从本地提取）
-// 返回 { audioPath, videoPath }，videoPath 可能为空
+// 从视频中提取音频（双保险：yt-dlp 直接提取 → 下载视频后用 ffmpeg 提取）
+// 返回 { audioPath, videoPath }，videoPath 在降级时不为空
 async function extractAudio(videoUrl, fallbackUrl) {
   console.log(`🎵 提取音频: ${videoUrl}`)
   
@@ -499,7 +511,7 @@ async function extractAudio(videoUrl, fallbackUrl) {
   }
 }
 
-// Whisper 转写（语音转文字）- 优化版
+// 本地 Whisper 语音转文字（现已弃用，被云端 ASR 替代，保留作降级）
 async function transcribeWithWhisper(audioPath, language = 'zh') {
   console.log(`🎙️ 开始语音转文字，语言: ${language}`)
   
@@ -580,7 +592,7 @@ if __name__ == "__main__":
   })
 }
 
-// 视频类型检测
+// 基于标题和描述的关键词匹配，检测视频类型（interview/music/sports/tutorial）
 function detectVideoType(title, description, duration) {
   const text = (title + ' ' + (description || '')).toLowerCase()
   
@@ -596,7 +608,7 @@ function detectVideoType(title, description, duration) {
   musicKeywords.forEach(kw => { if (text.includes(kw)) musicScore++ })
   sportsKeywords.forEach(kw => { if (text.includes(kw)) sportsScore++ })
   
-  // 体育赛事优先识别，走默认转录路径（非音乐模式）
+  // 体育赛事优先识别，保持常规转录路径（非音乐模式，不跳过逐字稿）
   if (sportsScore > 0) return 'sports'
 
   if (duration && duration < 600 && musicScore > 0) musicScore += 0.5
@@ -606,7 +618,7 @@ function detectVideoType(title, description, duration) {
   return 'tutorial'
 }
 
-// 智能转写路由 — 跳过本地 Whisper，使用云端 API 转写
+// 智能转写路由入口：提取音频后交由云端 API 转写（已跳过本地 Whisper）
 async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDuration, enableSpeakerDiarization, fallbackUrl) {
   const videoType = detectVideoType(videoTitle, videoDescription, videoDuration)
   console.log(`📊 视频类型检测: ${videoType}`)
@@ -621,7 +633,7 @@ async function smartTranscribe(videoUrl, videoTitle, videoDescription, videoDura
   return { text: "", audioPath, method: 'none', videoType, videoPath }
 }
 
-// 抽帧（视频画面截图），间隔抽帧 + 高质量
+// 从视频中间隔抽取关键帧画面（支持 URL 和本地文件），返回 base64 图片数组
 async function extractFrames(videoUrl, duration, maxFrames = 8, localPath = '') {
   if (!videoUrl && !localPath) return []
   const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
@@ -635,7 +647,11 @@ async function extractFrames(videoUrl, duration, maxFrames = 8, localPath = '') 
   console.log(`🎬 抽帧: ${localPath ? '本地文件' : 'URL'}, interval=${interval}s, ${maxFrames}帧`)
 
   // -q:v 1 最高质量，-vsync vfr 避免重复帧
-  const cmd = `ffmpeg -y -i "${inputSource}" -vf "fps=1/${interval}" -vframes ${maxFrames} -q:v 1 -vsync vfr "${outputPattern}" -loglevel error`
+  // B站 CDN 需要添加 Referer 防盗链头，否则返回 403
+  const refererHeader = (!localPath && videoUrl && videoUrl.includes('bilibili.com'))
+    ? '-headers "Referer: https://www.bilibili.com/\r\n" '
+    : ''
+  const cmd = `ffmpeg -y ${refererHeader}-i "${inputSource}" -vf "fps=1/${interval}" -vframes ${maxFrames} -q:v 1 -vsync vfr "${outputPattern}" -loglevel error`
 
   try {
     await execPromise(cmd, { timeout: 120000 })
@@ -658,7 +674,7 @@ async function extractFrames(videoUrl, duration, maxFrames = 8, localPath = '') 
   }
 }
 
-// 统一本地视频处理管道（用于已下载的视频文件或本地上传）
+// 统一本地视频处理管道：提取音频 → Whisper 转写 → 抽帧（用于已下载文件或本地上传）
 async function processLocalVideo(localPath, duration) {
   console.log(`📦 处理本地视频: ${localPath}`)
 
@@ -679,7 +695,7 @@ async function processLocalVideo(localPath, duration) {
   return { text, frames }
 }
 
-// 场景检测抽帧 — 提取画面切换点的关键帧
+// 基于场景切换检测的智能抽帧：提取画面切换点的关键帧（比固定间隔更精准）
 async function extractSceneFrames(videoPath, maxFrames = 5) {
   const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
   const frameDir = path.join(tempDir, `scenes_${tempId}`)
@@ -713,7 +729,7 @@ async function extractSceneFrames(videoPath, maxFrames = 5) {
   }
 }
 
-// 压缩音频为 WAV 16kHz 16bit 单声道（ASR 友好）
+// 将音频压缩为 WAV 16kHz 16bit 单声道（云端 ASR 服务要求的输入格式）
 async function compressAudio(audioPath) {
   const tempId = Date.now() + '_' + Math.random().toString(36).substring(2, 8)
   const compressedPath = path.join(tempDir, `${tempId}_compressed.wav`)
@@ -728,12 +744,15 @@ async function compressAudio(audioPath) {
   }
 }
 
-// 用 fun-asr-flash 转写音频（分批并行）
+// 使用百炼 fun-asr-flash 云端模型进行语音转文字（代替本地 Whisper）
+// 支持超长音频：分段并行转写后合并结果
 async function transcribeAudioWithOmni(audioPath, videoTitle = '') {
+  // 第一步：压缩音频为 ASR 服务要求的 WAV 格式
   const compressedPath = await compressAudio(audioPath)
   if (!compressedPath) return ''
 
-  // 获取音频时长(秒)
+  // 第二步：获取音频时长（秒），用于分段
+  let duration = 0
   let duration = 0
   try {
     const { stdout } = await execPromise(`ffprobe -i "${compressedPath}" -show_entries format=duration -v quiet -of csv="p=0"`, { timeout: 10000 })
@@ -744,7 +763,7 @@ async function transcribeAudioWithOmni(audioPath, videoTitle = '') {
     return ''
   }
 
-  // 按3分钟分段（fun-asr-flash 支持最长5分钟）
+  // 第三步：按3分钟一段分割音频（fun-asr-flash 单次支持最长5分钟）
   const chunkDuration = 180
   const numChunks = Math.ceil(duration / chunkDuration)
   const chunkDir = path.join(tempDir, `chunks_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`)
@@ -760,11 +779,13 @@ async function transcribeAudioWithOmni(audioPath, videoTitle = '') {
     return ''
   }
 
+  // 第四步：构造标题上下文提示（辅助 ASR 识别领域专有名词）
   const contextHint = videoTitle ? `视频标题：${videoTitle}，根据标题提供的领域信息辅助识别专有名词。` : ''
 
   const files = fs.readdirSync(chunkDir).filter(f => f.endsWith('.wav')).sort()
   console.log(`🔊 ASR 转写: ${files.length} 段, 共 ${duration}s`)
 
+  // 第五步：并行调用 ASR API 转写所有分段
   const results = await Promise.all(files.map(async (file, i) => {
     const filePath = path.join(chunkDir, file)
     const b64 = fs.readFileSync(filePath).toString('base64')
@@ -800,17 +821,18 @@ async function transcribeAudioWithOmni(audioPath, videoTitle = '') {
     }
   }))
 
+  // 第六步：合并所有分段转写结果，返回完整逐字稿
   const fullText = results.filter(Boolean).join('\n').trim()
   console.log(`📝 完整逐字稿: ${fullText.length} 字`)
 
-  // 清理
+  // 清理临时文件
   cleanupTempFile(compressedPath)
   if (fs.existsSync(chunkDir)) { try { fs.rmdirSync(chunkDir, { recursive: true }) } catch {} }
 
   return fullText
 }
 
-// AI 模型调用
+// 通用 AI 模型调用函数：支持纯文本 + 图片多模态，返回解析后的 JSON 对象
 async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
   const { apiKey, baseUrl, model, maxTokens = 3000, temperature = 0.7 } = config
 
@@ -822,28 +844,32 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 180000)
 
+    // 构建消息数组：system prompt + 用户内容（文字 + 可选图片帧）
     const messages = [
       { role: 'system', content: systemPrompt }
     ]
 
+    // 多模态分支：有图片帧时构建图文混合消息
     if (frames.length > 0) {
       const content = [{ type: 'text', text: userPrompt }]
       frames.forEach(frame => {
         content.push({ type: 'image_url', image_url: { url: frame } })
       })
       messages.push({ role: 'user', content })
-    } else {
+    }
+    // 纯文本分支
+    else {
       messages.push({ role: 'user', content: userPrompt })
     }
 
+    // 构建 API 请求体
     const requestBody = {
       model: model,
       messages,
       temperature: temperature,
       max_tokens: maxTokens
     }
-    // omni 模型（qwen3.*-omni-*）支持 JSON 模式，即使带图片
-    // 只有 qwen2.5-vl-* VL 模型不支持此参数
+    // omni 模型支持 JSON 输出模式，即使同时传图片；VL 模型不支持此参数
     if (frames.length === 0 || model.includes('omni')) {
       requestBody.response_format = { type: 'json_object' }
     }
@@ -938,29 +964,42 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
   }
 }
 
-// 统一数组格式（字符串/对象/空值 → 字符串数组）
+// 统一数组格式化：将字符串、对象数组或空值统一转为字符串数组（去重 + 序号归一化）
 function normalizeStringList(value) {
+  // 每项处理：清理噪音标点 + 序号归一化 1) 1、→ 1.
+  const cleanItem = (s) => {
+    s = String(s)
+    // 清理数字序号前的噪音标点（如 "，1)" → "1)"）
+    s = s.replace(/^[^\w\d]*(\d+[\)、）])/, '$1')
+    // 将 N) N、 N）统一为 N. 格式
+    s = s.replace(/^(\d+)[\)、）]/, '$1. ')
+    // 移除列表标记符号（- * • 等），保留纯文本
+    s = s.replace(/^[-*•]\s*/, '')
+    return s.trim()
+  }
+
   if (Array.isArray(value)) {
     return value
       .map(item => {
-        if (typeof item === 'string') return item
-        if (item && typeof item === 'object') return item.text || item.name || item.title || item.point || ''
+        if (typeof item === 'string') return cleanItem(item)
+        if (item && typeof item === 'object') return cleanItem(item.text || item.name || item.title || item.point || '')
         return ''
       })
-      .map(item => String(item).replace(/^\s*(\d+[\.\)、)]|[-*•])\s*/, '').trim())
       .filter(Boolean)
   }
 
   if (typeof value === 'string') {
+    // 优先按换行拆分，再逐行归一化
     return value
-      .split(/\n+|(?:\d+[\.\)、)]\s*)/)
-      .map(item => item.trim())
+      .split('\n')
+      .map(item => cleanItem(item))
       .filter(Boolean)
   }
 
   return []
 }
 
+// 从摘要中按标点拆分成句子，提取前5条作为关键要点（兜底方案）
 function pointsFromSummary(summary, title) {
   const text = String(summary || '').replace(/\s+/g, ' ').trim()
   const sentences = text
@@ -977,7 +1016,7 @@ function pointsFromSummary(summary, title) {
   return points
 }
 
-// 递归展平 JSON 字符串字段：如果字段值是 JSON 字符串，解析并提取
+// 递归展平：检测并解析 JSON 字符串字段（模型有时将对象序列化成字符串返回）
 function tryParseField(value, depth = 0) {
   if (depth > 3) return value
   if (typeof value !== 'string') return value
@@ -998,6 +1037,7 @@ function tryParseField(value, depth = 0) {
   return value
 }
 
+// 归一化 AI 模型分析结果：处理嵌套 JSON、缺失字段、垃圾数据，返回结构化分析
 function normalizeAnalysisResult(raw, context = {}) {
   const result = raw && typeof raw === 'object' ? raw : {}
   const title = context.title || result.title || '视频'
@@ -1066,10 +1106,24 @@ function normalizeAnalysisResult(raw, context = {}) {
   const quotes = normalizeStringList(useInner ? (inner.quotes || result.quotes) : (result.quotes || []))
   const keyTakeaway = String(useInner ? (inner.keyTakeaway || result.keyTakeaway || '') : (result.keyTakeaway || '')).trim()
 
+  // 检测 summary 是否为垃圾内容（仅含标点/极短），若无效则从 keyPoints 拼接
+  let finalSummary = summary
+  if (finalSummary) {
+    const stripped = finalSummary.replace(/[，。！？、；：,\.!\?;:\s"'「」『』【】\[\]\(\)（）]/g, '')
+    if (stripped.length < 5) {
+      const fallbackParts = []
+      if (keyPoints.length > 0) fallbackParts.push(keyPoints.slice(0, 3).join('；'))
+      if (topics.length > 0) fallbackParts.push('涉及话题：' + topics.join('、'))
+      finalSummary = fallbackParts.length > 0
+        ? fallbackParts.join('。')
+        : `基于有限信息推断，视频《${title}》为主题内容。当前缺少完整正文，系统已尽量提炼核心信息。`
+    }
+  }
+
   return {
     ...result,
     title: result.title || title,
-    summary: summary || `基于有限信息推断，视频《${title}》围绕标题与可获取素材展开。当前缺少完整正文，系统已尽量提炼核心主题、可能观点和观看价值，建议结合原视频继续核对细节。`,
+    summary: finalSummary,
     keyPoints: keyPoints.slice(0, 10),
     topics: topics.slice(0, 10),
     details,
@@ -1079,6 +1133,7 @@ function normalizeAnalysisResult(raw, context = {}) {
   }
 }
 
+// 获取模型配置：fastest（豆包免费模型）和 recommended（百炼专业模型，需 VIP）
 function getModelConfig(modelType) {
   const modelConfigs = {
     fastest: {
@@ -1176,7 +1231,8 @@ function getModelConfig(modelType) {
   return modelConfigs[modelType]
 }
 
-// 双通道分析（文字+画面），使用全模态模型
+// ========== 全模态视频分析（文字逐字稿 + 视频画面帧）==========
+// 使用 omni 多模态模型同时分析音频转写文本和视频截图
 async function analyzeWithFrames(title, content, videoUrl, frames, modelType = 'recommended') {
   const config = getModelConfig(modelType)
   if (!config) throw new Error(`未知的模型类型: ${modelType}`)
@@ -1184,6 +1240,7 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
   const vlModel = modelType === 'fastest' ? BAILIAN_MODEL_OMNI_FLASH : BAILIAN_MODEL_OMNI
   console.log(`🎬 全模态分析: ${frames.length} 帧, 模型=${vlModel}`)
 
+  // 构建视觉模型配置（omni 全模态）
   const vlConfig = {
     apiKey: BAILIAN_API_KEY,
     baseUrl: BAILIAN_BASE_URL,
@@ -1192,7 +1249,7 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
     temperature: 0.7
   }
 
-  // 赛事知识：防止模型因不了解新赛制而出错
+  // 赛事知识：注入2026世界杯新赛制，防止模型因不了解48队扩军而出错
   const worldCupContext = `【参考资料】2026年美加墨世界杯是首次扩军至48队的赛事（此前为32队）。赛制：
 - 12个小组×4队，小组前两名+8个成绩最好的小组第三出线
 - 第一轮淘汰赛为1/16决赛（32强→16强），并非1/8决赛
@@ -1200,6 +1257,7 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
 - 随后依次为1/4决赛、半决赛、决赛
 - 如果视频标题或逐字稿中的比赛涉及2026年世界杯淘汰赛，需注意区分轮次名称：首轮淘汰赛应称为"1/16决赛"而非"1/8决赛"`
 
+  // 判断是否有足够的逐字稿内容（>10字符认为是有效稿件）
   const hasTranscript = content && content.trim().length > 10
   const jsonSchema = `{
   "summary": "深度摘要，覆盖主题背景、核心内容和价值洞察（500字以上）",
@@ -1222,6 +1280,7 @@ async function analyzeWithFrames(title, content, videoUrl, frames, modelType = '
   "quotes": ["提炼的金句或总结句（每条附解读）"],
   "keyTakeaway": "一句话核心记忆点（30字以内）"
 }`
+  // 有逐字稿时：详细分析 prompt；无逐字稿时：仅基于画面分析，禁止编造
   const systemPrompt = hasTranscript
     ? `你是资深视频内容分析师，拥有视觉理解能力。你会同时收到视频的【完整逐字稿】和【视频画面截图】。
 你需要结合两者进行分析：文字提供对话、术语和数据，画面提供图表、表情、实物演示、PPT、场景氛围等视觉信息。
@@ -1253,12 +1312,16 @@ ${worldCupContext}
 只返回纯 JSON，不要 Markdown，严格按以下格式：
 ${jsonSchema}`
 
+  // 拼接用户 prompt（标题 + 链接 + 逐字稿/无稿提示）
   const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n${hasTranscript ? `【完整逐字稿】\n${content.substring(0, 30000)}` : '【无逐字稿，仅依据画面截图分析】'}`
 
+  // 调用多模态 AI 模型，传入文字 + 画面帧
   const raw = await callAIModel(vlConfig, systemPrompt, userPrompt, frames)
+  // 归一化结果后返回
   return normalizeAnalysisResult(raw, { title, videoUrl })
 }
 
+// 纯文字模型分析（无画面）：基于逐字稿 + 标题进行深度内容分析
 async function analyzeWithModel(title, content, videoUrl, modelType = 'recommended') {
   const config = getModelConfig(modelType)
   if (!config) throw new Error(`未知的模型类型: ${modelType}`)
@@ -1268,6 +1331,7 @@ async function analyzeWithModel(title, content, videoUrl, modelType = 'recommend
   return normalizeAnalysisResult(raw, { title, videoUrl })
 }
 
+// 备用分析方案：当既无逐字稿又无画面时，仅基于标题和简介推断
 async function analyzeWithoutContent(title, description, videoUrl, modelType = 'recommended') {
   console.log(`使用备用分析方案，模型: ${modelType}`)
   const config = getModelConfig(modelType)
@@ -1278,6 +1342,7 @@ async function analyzeWithoutContent(title, description, videoUrl, modelType = '
   return normalizeAnalysisResult(raw, { title, videoUrl })
 }
 
+// 将秒数格式化为可读的 HH:MM:SS 或 MM:SS 格式
 function formatDuration(seconds) {
   if (!seconds) return '未知'
   const hours = Math.floor(seconds / 3600)
@@ -1287,7 +1352,7 @@ function formatDuration(seconds) {
   return `${minutes}:${String(secs).padStart(2, '0')}`
 }
 
-// 转写后纠错：用文本模型根据视频标题修正错别字
+// ASR 转写后纠错：利用文本模型根据视频标题修正同音错别字（领域知识辅助）
 async function correctTranscription(text, videoTitle) {
   if (!text || text.length < 10) return text
   const systemPrompt = '你是一个语音转写纠错助手。根据视频标题提供的上下文，修正文本中的错别字和同音错误。只修正有把握的错误，不要改动无错误的部分。直接输出修正后的文本，不要多余的解释。'
@@ -1296,7 +1361,7 @@ async function correctTranscription(text, videoTitle) {
     const resp = await fetch(`${BAILIAN_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BAILIAN_API_KEY}` },
-      body: JSON.stringify({ model: BAILIAN_MODEL_FLASH, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], max_tokens: 30000 })
+      body: JSON.stringify({ model: BAILIAN_MODEL_FLASH, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] })
     })
     if (!resp.ok) { console.warn(`⚠️ 转写纠错失败: ${resp.status}`); return text }
     const data = await resp.json()

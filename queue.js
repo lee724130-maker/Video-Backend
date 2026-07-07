@@ -1,17 +1,17 @@
-// queue.js
+// Bull 队列配置：管理视频解析任务的排队、重试、超时和监控
 const Queue = require('bull')
 const { createBullBoard } = require('@bull-board/api')
 const { BullAdapter } = require('@bull-board/api/bullAdapter')
 const { ExpressAdapter } = require('@bull-board/express')
 
-// Redis 配置（如果没有 Redis，可以用内存队列，但不推荐生产环境）
+// Redis 连接配置（无 Redis 时可用内存队列，但生产环境不推荐）
 const REDIS_CONFIG = {
   host: process.env.REDIS_HOST || 'localhost',
   port: process.env.REDIS_PORT || 6379,
   password: process.env.REDIS_PASSWORD || ''
 }
 
-// 创建视频解析队列
+// 创建视频解析队列（队列名: video-parser）
 const videoQueue = new Queue('video-parser', {
   redis: REDIS_CONFIG,
   defaultJobOptions: {

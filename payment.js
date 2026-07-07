@@ -1,19 +1,14 @@
 /**
  * 支付模块 — 支持三种模式（优先级从高到低）：
- *
- *   1. API 模式：已配置微信/支付宝商户号 → 走统一下单 + 回调
- *   2. 收款码模式：已配置 WECHAT_QR_URL / ALIPAY_QR_URL → 展示收款码，用户扫码付款
- *   3. 开发模式：以上均未配置 → 提示联系管理员手动开通
- *
- * 收款码模式说明：
- *   将你的微信/支付宝收款码图片上传到服务器或图床，
- *   在 .env 中配置图片 URL，用户支付后联系管理员确认即可。
+ *   1. API 模式：微信/支付宝商户号 → 统一下单 + 回调
+ *   2. 收款码模式：展示个人收款码，用户付款后联系管理员确认
+ *   3. 开发模式：未配置支付 → 提示联系管理员手动开通
  */
 const crypto = require('crypto')
 
-// ========== 配置 ==========
+// ========== 微信/支付宝商户配置 ==========
 
-// --- API 模式（商户号）---
+// --- API 模式（商户号配置）---
 const WECHAT_APPID = process.env.WECHAT_APPID || ''
 const WECHAT_MCH_ID = process.env.WECHAT_MCH_ID || ''
 const WECHAT_API_KEY = process.env.WECHAT_API_KEY || ''
@@ -24,21 +19,23 @@ const ALIPAY_PRIVATE_KEY = process.env.ALIPAY_PRIVATE_KEY || ''
 const ALIPAY_PUBLIC_KEY = process.env.ALIPAY_PUBLIC_KEY || ''
 const ALIPAY_NOTIFY_URL = process.env.ALIPAY_NOTIFY_URL || ''
 
-// --- 收款码模式（个人收款码图片URL）---
+// --- 收款码模式（个人微信/支付宝收款码图片 URL）---
 const WECHAT_QR_URL = process.env.WECHAT_QR_URL || ''
 const ALIPAY_QR_URL = process.env.ALIPAY_QR_URL || ''
 const PAYMENT_INSTRUCTIONS = process.env.PAYMENT_INSTRUCTIONS || '请扫描二维码付款，完成后联系管理员确认开通'
 
+// 检测是否已配置商户 API 模式
 function isApiMode() {
   return !!(WECHAT_APPID && WECHAT_MCH_ID && WECHAT_API_KEY) ||
          !!(ALIPAY_APP_ID && ALIPAY_PRIVATE_KEY && process.env.ALIPAY_API_READY === 'true')
 }
 
+// 检测是否已配置收款码模式（API 模式优先）
 function isQrMode() {
   return !isApiMode() && !!(WECHAT_QR_URL || ALIPAY_QR_URL)
 }
 
-// ========== VIP 价格配置 ==========
+// ========== VIP/积分套餐价格配置 ==========
 const VIP_PLANS = {
   basic: { name: 'VIP 会员', price: 12.9, days: 30, credits: 500, level: 'basic' },
   yearly: { name: 'VIP 年费', price: 88, days: 365, credits: 5000, level: 'yearly' }
@@ -67,7 +64,7 @@ function getPlan(planId) {
   return ALL_PLANS[planId] || null
 }
 
-// ========== 微信支付（JSAPI / 小程序支付）==========
+// ========== 微信支付下单（JSAPI/小程序支付 API + 收款码 + 开发模式三路降级）==========
 async function createWechatOrder(pool, userId, planId, clientIp = '127.0.0.1') {
   const plan = getPlan(planId)
   if (!plan) throw new Error('无效的套餐')
@@ -75,24 +72,24 @@ async function createWechatOrder(pool, userId, planId, clientIp = '127.0.0.1') {
   const outTradeNo = `WX${Date.now()}${Math.random().toString(36).substring(2, 8).toUpperCase()}`
   const totalFee = Math.round(plan.price * 100) // 微信支付用分
 
-  // 创建本地订单
+  // 在数据库中创建微信支付订单（状态: pending）
   await pool.query(
     `INSERT INTO payment_orders (order_no, user_id, plan_id, amount, provider, status, created_at, updated_at)
      VALUES (?, ?, ?, ?, 'wechat', 'pending', NOW(), NOW())`,
     [outTradeNo, userId, planId, plan.price]
   )
 
-  // 收款码模式
+  // 收款码模式：返回收款码图片 URL，用户扫码后联系管理员确认
   if (isQrMode() && WECHAT_QR_URL) {
     return { success: true, mode: 'qr', orderNo: outTradeNo, qrUrl: WECHAT_QR_URL, amount: plan.price, planName: plan.name, instructions: PAYMENT_INSTRUCTIONS }
   }
 
-  // 开发模式
+  // 开发模式：无商户配置时提示联系管理员
   if (!isApiMode() || !WECHAT_APPID || !WECHAT_MCH_ID || !WECHAT_API_KEY) {
     return { success: true, mode: 'dev', orderNo: outTradeNo, message: '支付服务未配置，请联系管理员手动开通VIP' }
   }
 
-  // API 模式：微信支付统一下单
+  // API 模式：调用微信支付统一下单接口
   const nonceStr = Math.random().toString(36).substring(2, 17)
   const params = {
     appid: WECHAT_APPID,
@@ -123,7 +120,7 @@ async function createWechatOrder(pool, userId, planId, clientIp = '127.0.0.1') {
     throw new Error(result.err_code_des || result.return_msg || '微信支付下单失败')
   }
 
-  // 返回小程序/JSAPI 支付所需参数
+  // 返回小程序/JSAPI 支付所需的 prepay_id 和签名参数
   const payParams = {
     appId: WECHAT_APPID,
     timeStamp: String(Math.floor(Date.now() / 1000)),
@@ -141,21 +138,21 @@ async function createWechatOrder(pool, userId, planId, clientIp = '127.0.0.1') {
   }
 }
 
-// ========== 支付宝支付（电脑网站支付 / H5）==========
+// ========== 支付宝支付下单（电脑网站支付/H5 + 收款码 + 开发模式降级）==========
 async function createAlipayOrder(pool, userId, planId) {
   const plan = getPlan(planId)
   if (!plan) throw new Error('无效的套餐')
 
   const outTradeNo = `ALI${Date.now()}${Math.random().toString(36).substring(2, 8).toUpperCase()}`
 
-  // 创建本地订单
+  // 在数据库中创建支付宝订单（状态: pending）
   await pool.query(
     `INSERT INTO payment_orders (order_no, user_id, plan_id, amount, provider, status, created_at, updated_at)
      VALUES (?, ?, ?, ?, 'alipay', 'pending', NOW(), NOW())`,
     [outTradeNo, userId, planId, plan.price]
   )
 
-  // 收款码模式
+  // 收款码模式：返回支付宝收款码图片 URL
   if (isQrMode() && ALIPAY_QR_URL) {
     return { success: true, mode: 'qr', orderNo: outTradeNo, qrUrl: ALIPAY_QR_URL, amount: plan.price, planName: plan.name, instructions: PAYMENT_INSTRUCTIONS }
   }
@@ -165,7 +162,7 @@ async function createAlipayOrder(pool, userId, planId) {
     return { success: true, mode: 'dev', orderNo: outTradeNo, message: '支付服务未配置，请联系管理员手动开通VIP' }
   }
 
-  // API 模式：支付宝页面支付
+  // API 模式：构造支付宝页面支付参数（含 RSA2 签名）
   const bizContent = {
     out_trade_no: outTradeNo,
     product_code: 'FAST_INSTANT_TRADE_PAY',
@@ -199,7 +196,7 @@ async function createAlipayOrder(pool, userId, planId) {
   }
 }
 
-// ========== 验证微信支付回调 ==========
+// ========== 验证微信支付回调（解析 XML + 验签）==========
 function verifyWechatCallback(xmlData) {
   const data = xmlToObj(xmlData)
   if (!data || data.return_code !== 'SUCCESS') return null
@@ -222,7 +219,7 @@ function verifyWechatCallback(xmlData) {
   }
 }
 
-// ========== 验证支付宝回调 ==========
+// ========== 验证支付宝回调（参数验签）==========
 function verifyAlipayCallback(params) {
   const sign = params.sign
   delete params.sign
@@ -243,7 +240,7 @@ function verifyAlipayCallback(params) {
   }
 }
 
-// ========== 激活 VIP ==========
+// ========== 激活 VIP/积分（回调或管理员确认后执行）==========
 async function activateVip(pool, orderNo, provider, transactionId, amount) {
   // 查询订单
   const [orders] = await pool.query(
@@ -269,7 +266,7 @@ async function activateVip(pool, orderNo, provider, transactionId, amount) {
     [transactionId, orderNo]
   )
 
-  // 激活 VIP（如果已有VIP则在原到期时间基础上延长）
+  // 激活 VIP：如有现有 VIP 则在原到期时间上延长；积分套餐则仅加积分
   const [users] = await pool.query(
     'SELECT vip_level, vip_expired_at, credits_balance FROM app_users WHERE id = ? AND deleted_at IS NULL',
     [order.user_id]
@@ -315,7 +312,7 @@ async function activateVip(pool, orderNo, provider, transactionId, amount) {
   return true
 }
 
-// ========== 管理员手动开通（开发模式/未配置支付时）==========
+// ========== 管理员手动开通 VIP（开发模式/未配置支付时使用）==========
 async function adminActivateVip(pool, userId, planId) {
   const plan = getVipPlan(planId)
   if (!plan) throw new Error('无效的套餐')
@@ -332,7 +329,7 @@ async function adminActivateVip(pool, userId, planId) {
   return { success: true, orderNo: outTradeNo, plan: plan.name }
 }
 
-// ========== 辅助函数 ==========
+// ========== 辅助函数：微信签名/支付宝签名/XML 互转 ==========
 function wechatSign(params, apiKey) {
   const sortedKeys = Object.keys(params).filter(k => k !== 'sign' && params[k] !== undefined && params[k] !== '').sort()
   const stringA = sortedKeys.map(k => `${k}=${params[k]}`).join('&')

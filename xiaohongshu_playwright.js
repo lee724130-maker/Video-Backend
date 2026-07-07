@@ -1,9 +1,11 @@
+// 使用 Playwright 无头浏览器解析小红书视频（含 HTTP 直取 + Playwright 双层降级）
 const { chromium } = require('playwright')
 const https = require('https')
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
 
+// 单例 Chromium 浏览器实例
 let _browser = null
 
 async function getBrowser() {
@@ -23,6 +25,7 @@ async function closeBrowser() {
   }
 }
 
+// HTTP GET 请求工具（处理重定向、超时，优先用原生模块避免 fetch 限制）
 function httpGet(url, timeout = 15000) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https') ? https : http
@@ -47,18 +50,21 @@ function httpGet(url, timeout = 15000) {
   })
 }
 
+// 从 HTML 中提取 Open Graph meta 标签内容
 function extractMetaTag(html, property) {
   const re = new RegExp(`<meta\\s+property=["']${property}["']\\s+content=["']([^"']+)["']`, 'i')
   const m = html.match(re)
   return m ? m[1] : null
 }
 
+// 从 HTML 中提取 window.__INITIAL_STATE__ JSON 数据
 function extractInitialState(html) {
   const m = html.match(/window\.__INITIAL_STATE__\s*=\s*({.+?});?\s*<\/script>/)
   if (!m) return null
   try { return JSON.parse(m[1]) } catch { return null }
 }
 
+// 从 __INITIAL_STATE__ 对象中提取视频信息（标题、时长、封面、作者、播放地址）
 function extractVideoFromState(state) {
   if (!state?.note?.noteDetailMap) return null
   const noteId = Object.keys(state.note.noteDetailMap)[0]
@@ -83,8 +89,9 @@ function extractVideoFromState(state) {
   }
 }
 
+// 主解析函数：HTTP 直取 → Playwright 兜底，支持 Cookie 登录降级
 async function resolveXiaohongshuWithPlaywright(noteUrl, options = {}) {
-  // 第一步：HTTP 直取 HTML，解析 og:video / __INITIAL_STATE__
+  // ========== 第一层：HTTP 直取 HTML，解析 og:video / __INITIAL_STATE__ ==========
   console.log(`🌐 HTTP 解析小红书: ${noteUrl}`)
   try {
     const html = await httpGet(noteUrl)
@@ -124,7 +131,7 @@ async function resolveXiaohongshuWithPlaywright(noteUrl, options = {}) {
     console.warn(`⚠️ HTTP 解析失败: ${e.message}，回退 Playwright`)
   }
 
-  // 第二步：Playwright 兜底
+  // ========== 第二层：Playwright 无头浏览器兜底（支持重试 + Cookie）==========
   console.log(`🎭 Playwright 回退解析: ${noteUrl}`)
   const maxAttempts = options.retryOnFailure !== false ? 2 : 1
   let lastError
@@ -262,6 +269,7 @@ async function resolveXiaohongshuWithPlaywright(noteUrl, options = {}) {
   throw lastError || new Error('解析失败')
 }
 
+// 将时间字符串 "MM:SS" 或 "HH:MM:SS" 转为秒数
 function parseTimeToSeconds(str) {
   const parts = str.split(':').map(Number)
   if (parts.length === 2) return parts[0] * 60 + parts[1]

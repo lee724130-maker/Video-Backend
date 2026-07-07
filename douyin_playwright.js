@@ -1,5 +1,7 @@
+// 使用 Playwright 无头浏览器解析抖音视频（对抗反爬虫，videoProcessor 的第三层降级方案）
 const { chromium } = require('playwright');
 
+// 单例浏览器实例（复用连接，避免重复启动 Chromium）
 let _browser = null
 
 async function getBrowser() {
@@ -19,6 +21,7 @@ async function closeDouyinBrowser() {
   }
 }
 
+// 主解析函数：打开抖音页面 → 拦截 API 响应 → 提取视频信息
 async function resolveDouyinWithPlaywright(videoUrl) {
   console.log(`🎭 Playwright 解析抖音: ${videoUrl}`)
   let context
@@ -30,6 +33,7 @@ async function resolveDouyinWithPlaywright(videoUrl) {
       locale: 'zh-CN',
       timezoneId: 'Asia/Shanghai'
     })
+    // 注入反爬绕过脚本：隐藏 webdriver 特征
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false })
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] })
@@ -37,6 +41,7 @@ async function resolveDouyinWithPlaywright(videoUrl) {
     })
     const page = await context.newPage()
 
+    // 拦截抖音 API 响应，提取视频详情数据
     let videoApiData = null
     let apiUrlsFound = []
 
@@ -67,9 +72,11 @@ async function resolveDouyinWithPlaywright(videoUrl) {
       } catch {}
     })
 
+    // 先访问抖音首页建立会话，再处理目标链接
     await page.goto('https://www.douyin.com/', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {})
     await page.waitForTimeout(2000)
 
+    // 处理短链接：访问后获取重定向后的完整 URL
     let targetUrl = videoUrl
     if (videoUrl.includes('v.douyin.com') || !videoUrl.includes('douyin.com/video/')) {
       await page.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
@@ -90,7 +97,7 @@ async function resolveDouyinWithPlaywright(videoUrl) {
     const cookies = await context.cookies()
     const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ')
 
-    // 生成 Netscape 格式 cookie 文件
+    // 生成 Netscape 格式 Cookie 文件（供 yt-dlp 后续使用）
     const netscapeCookies = cookies.map(c => {
       const domain = c.domain.startsWith('.') ? c.domain : '.' + c.domain
       const includeSub = 'TRUE'
@@ -145,6 +152,7 @@ async function resolveDouyinWithPlaywright(videoUrl) {
   }
 }
 
+// 将带水印的播放 URL 转换为无水印版本（/playwm/ → /play/）
 function noWatermarkUrl(url) {
   if (!url) return ''
   return url.replace('/playwm/', '/play/').replace('playwm', 'play')
