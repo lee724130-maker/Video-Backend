@@ -46,6 +46,52 @@ function cleanupTempFile(filePath) {
   }
 }
 
+// ========== vision-tool 视觉分析引擎集成 ==========
+const VISION_TOOL_PATH = process.env.VISION_TOOL_PATH || path.join(__dirname, 'vision-tool', 'vision_proxy.py')
+const VISION_FRAME_ANALYZER_PATH = process.env.VISION_FRAME_ANALYZER_PATH || path.join(__dirname, 'vision-tool', 'analyze_frames.py')
+
+// 场景A: 有本地视频文件 → 直接调用 vision_proxy.py
+async function callVisionTool(videoPath, prompt = '') {
+  const escapedPath = `"${videoPath}"`
+  const escapedPrompt = prompt ? `"${prompt}"` : ''
+  const cmd = `python ${VISION_TOOL_PATH} ${escapedPath} ${escapedPrompt}`
+  try {
+    const { stdout } = await execPromise(cmd, { timeout: 120000 })
+    const lines = stdout.trim().split('\n')
+    const desc = lines.slice(1).join('\n').trim()
+    if (desc) console.log(`✅ vision-tool 描述: ${desc.length} 字`)
+    return desc
+  } catch (error) {
+    console.warn('⚠️ vision-tool 调用失败:', error.message)
+    return ''
+  }
+}
+
+// 场景B: 只有帧无本地文件 → 写帧到临时目录，调 analyze_frames.py
+async function callVisionToolWithFrames(frames, prompt = '') {
+  if (!frames || frames.length === 0) return ''
+  const tempDir = path.join(__dirname, 'temp', `vision_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`)
+  fs.mkdirSync(tempDir, { recursive: true })
+  try {
+    frames.forEach((b64, i) => {
+      const data = b64.replace(/^data:image\/\w+;base64,/, '')
+      fs.writeFileSync(path.join(tempDir, `frame_${i}.jpg`), data, 'base64')
+    })
+    const cmd = `python ${VISION_FRAME_ANALYZER_PATH} "${tempDir}" ${prompt ? `"${prompt}"` : ''}`
+    const { stdout } = await execPromise(cmd, { timeout: 120000 })
+    const lines = stdout.trim().split('\n')
+    const desc = lines.slice(1).join('\n').trim()
+    if (desc) console.log(`✅ vision-tool 帧分析: ${desc.length} 字`)
+    return desc
+  } catch (error) {
+    console.warn('⚠️ vision-tool 帧分析失败:', error.message)
+    return ''
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  }
+}
+// ========== vision-tool 结束 ==========
+
 // 从 YouTube URL 中提取视频 ID（支持多种 URL 格式）
 function extractYouTubeId(url) {
   const patterns = [
@@ -1350,6 +1396,41 @@ async function analyzeWithoutContent(title, description, videoUrl, modelType = '
   return normalizeAnalysisResult(raw, { title, videoUrl })
 }
 
+// vision-tool 兜底方案：当无逐字稿但有视觉描述时，将描述作为内容源分析
+async function analyzeWithVisionFallback(title, videoUrl, visionDescription, modelType = 'recommended') {
+  if (!visionDescription) {
+    return analyzeWithoutContent(title, '', videoUrl, modelType)
+  }
+  const config = getModelConfig(modelType)
+  const systemPrompt = `你是资深视频内容分析师。你将收到一段【AI视觉模型对视频画面的详细描述】和视频标题。
+请基于这些信息进行深度内容分析，输出结构化JSON。注意：
+1. 视觉描述可能包含画面中的文字内容（如截图、PPT、字幕），优先使用这些文字信息
+2. 禁止编造视觉描述中没有提及的具体细节
+3. 如果信息不足，标注"基于画面信息推断"
+只返回纯JSON，不要Markdown，严格按以下格式（所有字段必填，不可留空）：
+{
+  "summary": "深度摘要，覆盖主题背景、核心内容和价值洞察（300字以上）",
+  "keyPoints": ["要点1：具体观点+重要性说明", "要点2：具体观点+重要性说明"],
+  "topics": ["主题标签1", "主题标签2"],
+  "details": {
+    "mainArgument": "核心观点阐述",
+    "uniqueInsight": "最特别的洞察",
+    "actionAdvice": "可执行的建议"
+  },
+  "deepAnalysis": {
+    "structure": "内容结构分析",
+    "argumentQuality": "论证质量评估",
+    "uniqueValue": "差异分析",
+    "limitations": "局限性"
+  },
+  "quotes": ["提炼的金句或总结句"],
+  "keyTakeaway": "一句话核心记忆点"
+}`
+  const userPrompt = `视频标题：${title}\n视频链接：${videoUrl}\n\n【AI视觉模型描述】\n${visionDescription}`
+  const raw = await callAIModel(config, systemPrompt, userPrompt)
+  return normalizeAnalysisResult(raw, { title, videoUrl })
+}
+
 // 将秒数格式化为可读的 HH:MM:SS 或 MM:SS 格式
 function formatDuration(seconds) {
   if (!seconds) return '未知'
@@ -1393,11 +1474,14 @@ module.exports = {
   analyzeWithModel,
   analyzeWithFrames,
   analyzeWithoutContent,
+  analyzeWithVisionFallback,
   extractFrames,
   extractSceneFrames,
   transcribeAudioWithOmni,
   correctTranscription,
   formatDuration,
   cleanupTempFile,
-  processLocalVideo
+  processLocalVideo,
+  callVisionTool,
+  callVisionToolWithFrames
 }

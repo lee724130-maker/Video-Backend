@@ -11,12 +11,15 @@ const {
   analyzeWithModel,
   analyzeWithFrames,
   analyzeWithoutContent,
+  analyzeWithVisionFallback,
   extractFrames,
   extractSceneFrames,
   transcribeAudioWithOmni,
   correctTranscription,
   formatDuration,
-  cleanupTempFile
+  cleanupTempFile,
+  callVisionTool,
+  callVisionToolWithFrames
 } = require('./videoProcessor')
 
 // 注册队列消费者：每次并发处理1个任务（parse-video 类型）
@@ -79,17 +82,39 @@ videoQueue.process('parse-video', 1, async (job) => {
     // 最终传递给分析引擎的文本内容（优先使用 ASR 转写结果）
     const finalContent = transcript || contentText
 
-    // ========== 阶段5: AI 内容分析（全模态→纯文字降级）==========
+    // ========== 阶段5: AI 内容分析（vision-tool 视觉增强 + 全模态/文字降级）==========
     let analysisResult
     if (frames.length > 0) {
-      try {
-        analysisResult = await analyzeWithFrames(videoInfo.title, finalContent, url, frames, model)
-      } catch (e) {
-        console.warn('⚠️ 全模态分析失败，回退到文字分析:', e.message)
-        analysisResult = await analyzeWithModel(videoInfo.title, finalContent, url, model)
+      // █ 有帧可用 → vision-tool 视觉描述增强
+      let visionDescription = ''
+      if (localVideoPath) {
+        // 场景A: 有本地视频文件 → vision-tool 直接分析
+        visionDescription = await callVisionTool(localVideoPath)
+      } else if (!finalContent) {
+        // 场景B: 无逐字稿 + 只有帧 → vision-tool 帧分析兜底
+        visionDescription = await callVisionToolWithFrames(frames)
       }
-    } else {
+      // 合并 vision 描述到内容中
+      const enrichedContent = visionDescription
+        ? [finalContent, `【画面描述】\n${visionDescription}`].filter(Boolean).join('\n\n')
+        : finalContent
+
+      if (enrichedContent && enrichedContent.trim().length > 10) {
+        try {
+          // 有实质内容 → 全模态分析（Omni 模型同时处理文字+画面）
+          analysisResult = await analyzeWithFrames(videoInfo.title, enrichedContent, url, frames, model)
+        } catch (e) {
+          console.warn('⚠️ 全模态分析失败，回退到文字分析:', e.message)
+          analysisResult = await analyzeWithModel(videoInfo.title, enrichedContent, url, model)
+        }
+      } else {
+        // 完全无内容 → vision-tool 纯视觉兜底
+        analysisResult = await analyzeWithVisionFallback(videoInfo.title, url, visionDescription, model)
+      }
+    } else if (finalContent) {
       analysisResult = await analyzeWithModel(videoInfo.title, finalContent, url, model)
+    } else {
+      analysisResult = await analyzeWithoutContent(videoInfo.title, videoInfo.description, url, model)
     }
 
     // 清理本地下载的视频文件（如有）

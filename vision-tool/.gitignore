@@ -1,0 +1,44 @@
+# Config & secrets
+config.json
+.env
+.env.local
+test_*.py
+list_*.py
+_test_*.*
+assets/
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Node (if any)
+node_modules/
+
+# Temp
+temp/
+*.log
+*.tmp
+
+# Compiled
+*.exe
