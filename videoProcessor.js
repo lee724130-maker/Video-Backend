@@ -1107,7 +1107,7 @@ function normalizeAnalysisResult(raw, context = {}) {
   }
 
   // 从内层或外层提取 summary
-  const rawSummary = inner ? inner.summary || inner.overview || '' : tryParseField(rawSummaryField)
+  const rawSummary = inner ? tryParseField(inner.summary || inner.overview || '') : tryParseField(rawSummaryField)
   const summary = (typeof rawSummary === 'object' ? (rawSummary.summary || rawSummary.overview || '') : String(rawSummary)).trim()
 
   // 决定使用内层还是外层数据：有内层且内层包含 keyPoints 时优先用内层
