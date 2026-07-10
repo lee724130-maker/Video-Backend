@@ -1001,7 +1001,15 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
           // 两次 JSON 解析均失败，返回原始内容
         }
       }
-      return { summary: content.substring(0, 500) || '暂无摘要', keyPoints: [], topics: [] }
+      // 尝试修复截断的 JSON（Bailian 模型可能因 maxTokens 限制被截断）
+      let fallbackSummary = content.substring(0, 500) || '暂无摘要'
+      if (fallbackSummary.trim().startsWith('{')) {
+        try {
+          const repaired = JSON.parse(fallbackSummary + '}')
+          if (repaired.summary) fallbackSummary = repaired.summary
+        } catch {}
+      }
+      return { summary: fallbackSummary, keyPoints: [], topics: [] }
     }
 
   } catch (error) {
