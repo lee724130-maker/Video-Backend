@@ -1316,7 +1316,7 @@ function buildFallbackMindmap(title, points, summary = '') {
 async function generateMindmap(title, keyPoints, summary) {
   const apiKey = BAILIAN_API_KEY
   const baseUrl = process.env.BAILIAN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-  const model = process.env.BAILIAN_MODEL_PRO || 'tongyi-xiaomi-analysis-pro'
+  const model = process.env.BAILIAN_MODEL_PRO || 'qwen-plus'
   if (!apiKey) return null
 
   const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -3328,7 +3328,7 @@ async function startServer() {
     console.log(`=================================`)
     console.log(`📋 可用模型:`)
     console.log(`   ⚡ 最快: 豆包 (Doubao)`)
-    console.log(`   ⭐ 推荐: 阿里云百炼 (tongyi-xiaomi-analysis-pro)`)
+    console.log(`   ⭐ 推荐: 阿里云百炼 (qwen-plus)`)
     console.log(`=================================`)
   })
 

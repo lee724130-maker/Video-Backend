@@ -16,7 +16,7 @@ const tempDir = path.join(__dirname, 'temp')
 // ========== AI 模型 API 配置 ==========
 const BAILIAN_API_KEY = process.env.BAILIAN_API_KEY
 const BAILIAN_BASE_URL = process.env.BAILIAN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-const BAILIAN_MODEL_PRO = process.env.BAILIAN_MODEL_PRO || 'tongyi-xiaomi-analysis-pro'
+const BAILIAN_MODEL_PRO = process.env.BAILIAN_MODEL_PRO || 'qwen-plus'
 const BAILIAN_MODEL_FLASH = process.env.BAILIAN_MODEL_FLASH || 'tongyi-xiaomi-analysis-flash'
 const BAILIAN_MODEL_VL = process.env.BAILIAN_MODEL_VL || 'qwen2.5-vl-72b-instruct'
 const BAILIAN_MODEL_VL_LITE = process.env.BAILIAN_MODEL_VL_LITE || 'qwen2.5-vl-7b-instruct'
@@ -1228,7 +1228,7 @@ function getModelConfig(modelType) {
       apiKey: BAILIAN_API_KEY,
       baseUrl: BAILIAN_BASE_URL,
       model: BAILIAN_MODEL_PRO,
-      maxTokens: 4000, // tongyi-xiaomi-analysis-pro 调整为4000测试（原2000可能不足）
+      maxTokens: 8000, // qwen-plus 支持高tokens上限
       temperature: 0.75,
       requiresVip: true,
       systemPrompt: `你是资深视频内容分析师、知识提炼专家和批判性思维教练。你的分析要比普通AI深一个层次——不只复述内容，而是解构、连接、提炼底层逻辑。
