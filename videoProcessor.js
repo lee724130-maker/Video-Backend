@@ -1001,15 +1001,13 @@ async function callAIModel(config, systemPrompt, userPrompt, frames = []) {
           // 两次 JSON 解析均失败，返回原始内容
         }
       }
-      // 尝试修复截断的 JSON（Bailian 模型可能因 maxTokens 限制被截断）
-      let fallbackSummary = content.substring(0, 500) || '暂无摘要'
-      if (fallbackSummary.trim().startsWith('{')) {
-        try {
-          const repaired = JSON.parse(fallbackSummary + '}')
-          if (repaired.summary) fallbackSummary = repaired.summary
-        } catch {}
+      // Bailian 模型 JSON 截断时用 regex 直接提取 summary 字段值
+      let fallbackSummary = ''
+      if (content[0] === '{') {
+        const m = content.match(/"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+        if (m) fallbackSummary = m[1]
       }
-      return { summary: fallbackSummary, keyPoints: [], topics: [] }
+      return { summary: fallbackSummary || content.substring(0, 500) || '暂无摘要', keyPoints: [], topics: [] }
     }
 
   } catch (error) {
