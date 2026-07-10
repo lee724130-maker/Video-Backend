@@ -1228,7 +1228,7 @@ function getModelConfig(modelType) {
       apiKey: BAILIAN_API_KEY,
       baseUrl: BAILIAN_BASE_URL,
       model: BAILIAN_MODEL_PRO,
-      maxTokens: 2000, // tongyi-xiaomi-analysis-pro 上限 2000
+      maxTokens: 4000, // tongyi-xiaomi-analysis-pro 调整为4000测试（原2000可能不足）
       temperature: 0.75,
       requiresVip: true,
       systemPrompt: `你是资深视频内容分析师、知识提炼专家和批判性思维教练。你的分析要比普通AI深一个层次——不只复述内容，而是解构、连接、提炼底层逻辑。
